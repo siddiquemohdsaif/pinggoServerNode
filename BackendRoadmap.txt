@@ -1,0 +1,139 @@
+Wave Stream Backend Roadmap
+===========================
+
+Goal
+----
+Build the Node.js backend for Wave Stream so the Android app can use real authentication, users, chats, messages, calls, and media instead of predefined local data.
+
+Milestone 1: Backend Project Setup
+----------------------------------
+- Initialize Node.js project in WaveStreamServerNode.
+- Choose framework: Express.js or Fastify.
+- Add environment configuration for development and production.
+- Add standard scripts for start, dev, lint, and test.
+- Add folder structure for routes, controllers, services, models, middleware, config, and utils.
+- Add centralized error handling and request logging.
+
+Milestone 2: Database Setup
+---------------------------
+- Choose database: MongoDB, PostgreSQL, MySQL, or Firebase Admin SDK.
+- Add database connection config.
+- Create database models/tables for users, chats, messages, call logs, OTPs, and attachments.
+- Add indexes for phone lookup, chat participants, latest message time, message sent time, and call started time.
+- Add migration or schema setup process if using SQL.
+
+Milestone 3: Authentication And OTP
+-----------------------------------
+- Create API to request OTP using phone number.
+- Generate and store OTP securely with expiry time.
+- Replace Android fixed OTP 123456 with backend OTP verification.
+- Create API to verify OTP.
+- Create or find user by phone number after OTP verification.
+- Return auth token/session after successful verification.
+- Add JWT or session middleware for protected APIs.
+- Add OTP rate limiting and resend limits.
+
+Milestone 4: User Profile APIs
+------------------------------
+- Create API to complete signup with name, email, and DOB.
+- Create API to fetch logged-in user profile.
+- Create API to update profile fields.
+- Add validation for name, email, DOB, and phone number.
+- Add profile image field for future media support.
+
+Milestone 5: Chat List APIs
+---------------------------
+- Create chat model with id, participants, last message, last message time, unread counts, and created time.
+- Create API to fetch chat list for logged-in user.
+- Sort chat list by latest message time.
+- Create API to create or open one-to-one chat with another user.
+- Replace Android ChatsData predefined users with API response.
+
+Milestone 6: Message Send And Receive APIs
+------------------------------------------
+- Create message model with id, chat id, sender id, receiver id, text, attachment URL, sent time, delivered time, read time, and status.
+- Create API to fetch messages by chat id with pagination.
+- Create API to send message.
+- Validate sender is a participant of the chat.
+- Save sent message to database.
+- Update parent chat last message and last message time.
+- Increment unread count for receiver.
+- Mark messages delivered/read.
+- Add retry-safe message id handling to avoid duplicate sends.
+
+Milestone 7: Real-Time Messaging
+--------------------------------
+- Add WebSocket or Socket.IO server.
+- Authenticate socket connections using the same auth token.
+- Join user-specific socket rooms after login.
+- Join chat rooms when ChatActivity opens a chat.
+- Emit new message event to receiver and active chat participants.
+- Emit typing, delivered, and read events.
+- Handle reconnect and missed message sync using REST fetch.
+
+Milestone 8: Calls Backend
+--------------------------
+- Create call log model with id, caller id, receiver id, call type, started time, ended time, duration, and status.
+- Create API to fetch call logs for logged-in user.
+- Sort call logs newest first.
+- Create API to save new voice/video call log.
+- Create API to fetch single call detail by id.
+- Replace Android CallLogsData predefined calls with API response.
+- Add real-time incoming call events if live calling is implemented later.
+
+Milestone 9: Media And Attachments
+----------------------------------
+- Choose media storage: local storage, S3-compatible storage, Firebase Storage, or another provider.
+- Create API to upload attachments.
+- Save attachment metadata and URL in message records.
+- Validate file type and file size.
+- Add secure access rules for private chat attachments.
+- Add cleanup policy for failed or orphaned uploads.
+
+Milestone 10: Security And Validation
+-------------------------------------
+- Add request validation middleware.
+- Add authentication middleware for all protected APIs.
+- Ensure users can only access their own chats, messages, calls, and media.
+- Add rate limiting for OTP, login, signup, message send, and media upload.
+- Add CORS configuration if needed.
+- Add secure environment variable handling.
+
+Milestone 11: Android Integration Contract
+------------------------------------------
+- Document all API endpoints, request bodies, response bodies, and error formats.
+- Define Android models matching backend responses.
+- Define auth token storage and refresh strategy.
+- Define pagination parameters for messages.
+- Define realtime event names and payloads.
+- Add sample curl/Postman collection for backend testing.
+
+Milestone 12: Testing
+---------------------
+- Add unit tests for services and validators.
+- Add integration tests for auth, signup, chats, messages, and calls.
+- Add socket tests for message send/receive events.
+- Add database seed data for local development.
+- Add error-case tests for unauthorized access and invalid payloads.
+
+Milestone 13: Deployment
+------------------------
+- Add production environment config.
+- Add process manager setup such as PM2 or Docker.
+- Add database production connection setup.
+- Add logging and monitoring.
+- Add health check endpoint.
+- Add deployment instructions.
+- Verify Android app can connect to deployed backend over HTTPS.
+
+Suggested Implementation Order
+------------------------------
+1. Setup Node.js project and folder structure.
+2. Connect database and create models.
+3. Build OTP authentication APIs.
+4. Build signup/profile APIs.
+5. Build chat list and message APIs.
+6. Add WebSocket/Socket.IO realtime messaging.
+7. Build call log APIs.
+8. Add media upload support.
+9. Add security, tests, and deployment.
