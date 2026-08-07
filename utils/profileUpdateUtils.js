@@ -1,5 +1,5 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
-const AES = require("../utils/AES_256");
+const AES = require("./AES_256");
 
 const firestoreManager = FirestoreManager.getInstance();
 

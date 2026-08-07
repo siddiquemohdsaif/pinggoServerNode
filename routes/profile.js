@@ -1,6 +1,6 @@
 const express = require("express");
 const uploadProfilePhoto = require("./uploadProfilePhoto");
-const { updateProfileField } = require("./profileUpdateUtils");
+const { updateProfileField } = require("../utils/profileUpdateUtils");
 
 const router = express.Router();
 
