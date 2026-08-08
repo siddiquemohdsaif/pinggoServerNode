@@ -130,6 +130,71 @@ router.post("/sync", async (req, res) => {
   }
 });
 
+router.post("/discover", async (req, res) => {
+  try {
+    const phoneNumber = normalizeString(
+      req.body.phoneNumber || req.body.phone_number || req.body.phone,
+    );
+    const contacts = Array.isArray(req.body.contacts)
+      ? req.body.contacts
+      : req.body.phoneNumbers;
+
+    const validationError =
+      validatePhoneNumber({ phoneNumber }) || validateDiscoverContacts({ contacts });
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+
+    const ownPhoneNumber = normalizePhoneNumberForChatId(phoneNumber);
+    const accountId = formatPhoneNumberForAccountId(phoneNumber);
+    const chatsListDoc = await getChatsListByPhoneNumber(accountId);
+    const chatList = getChatIdsFromChatList(chatsListDoc && chatsListDoc.list);
+
+    const normalizedContacts = [...new Set(
+      contacts
+        .map(normalizePhoneNumberForChatId)
+        .filter((contactPhoneNumber) =>
+          /^\d{7,15}$/.test(contactPhoneNumber) &&
+          contactPhoneNumber !== ownPhoneNumber,
+        ),
+    )];
+
+    const results = await Promise.all(
+      normalizedContacts.map(async (contactPhoneNumber) => {
+        const profile = await getUserProfileSummary(contactPhoneNumber);
+        if (!profile) {
+          return {
+            phoneNumber: contactPhoneNumber,
+            found: false,
+          };
+        }
+
+        const existingChatId = findChatIdForContact(chatList, contactPhoneNumber);
+        const chatId = existingChatId || buildChatId(phoneNumber, contactPhoneNumber);
+
+        return {
+          ...profile,
+          phoneNumber: contactPhoneNumber,
+          found: true,
+          chatId,
+          isExistingChat: Boolean(existingChatId),
+        };
+      }),
+    );
+
+    return res.status(200).json({
+      success: true,
+      chatList,
+      contacts: results,
+      userProfiles: results.filter((contact) => contact.found),
+      notFound: results.filter((contact) => !contact.found),
+    });
+  } catch (error) {
+    console.error("Error in discover:", error.message);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
 async function getChatsListByPhoneNumber(phoneNumber) {
   try {
     const userDoc = await firestoreManager.readDocument(
@@ -198,6 +263,26 @@ function getOtherPhoneNumberFromChatId(chatId, phoneNumber) {
     phoneNumbers.find(
       (chatPhoneNumber) =>
         normalizePhoneNumberForChatId(chatPhoneNumber) !== accountPhoneNumber,
+    ) || ""
+  );
+}
+
+function buildChatId(currentPhoneNumber, otherPhoneNumber) {
+  const current = normalizePhoneNumberForChatId(currentPhoneNumber);
+  const other = normalizePhoneNumberForChatId(otherPhoneNumber);
+  if (!current || !other) {
+    return "";
+  }
+  return `${current}_${other}`;
+}
+
+function findChatIdForContact(chatList, phoneNumber) {
+  const normalizedPhoneNumber = normalizePhoneNumberForChatId(phoneNumber);
+  return (
+    chatList.find((chatId) =>
+      chatId
+        .split("_")
+        .some((part) => normalizePhoneNumberForChatId(part) === normalizedPhoneNumber),
     ) || ""
   );
 }
@@ -298,6 +383,9 @@ async function getUserProfileSummary(phoneNumber) {
     (await getUserByPhoneNumber(`<plus>${normalizedPhoneNumber}`)) ||
     (await getUserByPhoneNumber(normalizedPhoneNumber)) ||
     (await getUserByPhoneNumber(phoneNumber));
+  if (!userDoc) {
+    return null;
+  }
 
   const profileData = userDoc && userDoc.profileData ? userDoc.profileData : {};
   return {
@@ -329,6 +417,16 @@ function validateSyncRequest({ phoneNumber, lastSyncTime }) {
   }
   if (!Number.isFinite(lastSyncTime) || lastSyncTime < 0) {
     return "lastSyncTime must be a non-negative number.";
+  }
+  return null;
+}
+
+function validateDiscoverContacts({ contacts }) {
+  if (!Array.isArray(contacts)) {
+    return "contacts must be an array.";
+  }
+  if (contacts.length === 0) {
+    return "contacts must not be empty.";
   }
   return null;
 }

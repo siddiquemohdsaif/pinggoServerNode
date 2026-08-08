@@ -58,6 +58,7 @@ async function handleSendMessage(ws, payload, sendJson) {
   }
 
   try {
+    await ensureChatReadyForMessage(chatId, senderId, receiverId);
     await saveMessage(chatId, message);
     const receiverSocket = getUserSocket(receiverId);
     const receiverOnline = Boolean(receiverSocket);
@@ -512,9 +513,69 @@ async function saveMessage(chatId, message) {
   return result;
 }
 
+async function ensureChatReadyForMessage(chatId, senderId, receiverId) {
+  const chat = await getChat(chatId);
+  if (!chat) {
+    await createChatDocument(chatId);
+  }
+
+  await Promise.all([
+    addChatIdToChatsList(senderId, chatId),
+    addChatIdToChatsList(receiverId, chatId),
+  ]);
+}
+
+async function createChatDocument(chatId) {
+  try {
+    await firestoreManager.createDocument("Chats", chatId, "/", {});
+  } catch (error) {
+    await updateMessages(chatId, {});
+  }
+}
+
+async function addChatIdToChatsList(userId, chatId) {
+  const accountId = normalizeAccountId(userId);
+  const existingDoc = await getChatsList(accountId);
+  const list = Array.isArray(existingDoc && existingDoc.list)
+    ? existingDoc.list
+    : [];
+  if (list.includes(chatId)) {
+    return;
+  }
+
+  const updatedDoc = {
+    ...withoutDocumentId(existingDoc || {}),
+    list: [...list, chatId],
+  };
+
+  try {
+    if (existingDoc) {
+      await firestoreManager.updateDocument("ChatsList", accountId, "/", updatedDoc);
+    } else {
+      await firestoreManager.createDocument("ChatsList", accountId, "/", updatedDoc);
+    }
+  } catch (error) {
+    await firestoreManager.updateDocument("ChatsList", accountId, "/", updatedDoc);
+  }
+}
+
+function withoutDocumentId(document) {
+  const copy = { ...document };
+  delete copy._id;
+  return copy;
+}
+
 async function getChat(chatId) {
   try {
     return (await firestoreManager.readDocument("Chats", chatId, "/")) || null;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function getChatsList(userId) {
+  try {
+    return (await firestoreManager.readDocument("ChatsList", userId, "/")) || null;
   } catch (error) {
     return null;
   }
