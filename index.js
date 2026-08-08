@@ -1,9 +1,10 @@
 const express = require("express");
+const http = require("http");
 const path = require("path");
 const AES = require("./utils/AES_256");
+const { createWebSocketServer } = require("./realtime/websocketServer");
 const app = express();
 require("dotenv").config();
-const fs = require("fs").promises;
 
 let port;
 if (process.env.PRODUCTION_TYPE === "release") {
@@ -48,6 +49,9 @@ authorizedRoutes.use("/chats", chats);
 
 app.use("/", authorizedRoutes); // Use the grouped routes
 
-app.listen(port, () => {
+const server = http.createServer(app);
+createWebSocketServer(server);
+
+server.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });

@@ -46,12 +46,11 @@ router.post("/", async (req, res) => {
       AES.getEncryptedCredential(accountId, P_ID),
     );
 
-    await firestoreManager.createDocument(
-      "Users",
-      accountId,
-      "/",
-      userModel,
-    );
+    await firestoreManager.createDocument("Users", accountId, "/", userModel);
+
+    await firestoreManager.createDocument("ChatsList", accountId, "/", {
+      list: [],
+    });
 
     return res.status(200).json({
       success: true,

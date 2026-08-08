@@ -46,7 +46,7 @@ router.post("/getChat", async (req, res) => {
     if (validationError) {
       return res.status(400).json({ success: false, message: validationError });
     }
-    
+
     const chatId = req.body.chatId;
 
     if (!chatId) {
@@ -77,425 +77,55 @@ router.post("/getChat", async (req, res) => {
   }
 });
 
-router.post("/addMessage", async (req, res) => {
+router.post("/sync", async (req, res) => {
   try {
-    const chatId = req.body.chatId;
-    const senderId = req.body.senderId;
-    const receiverId = req.body.receiverId;
-    const text = req.body.text;
-    const repliedMessageId = req.body.repliedMessageId;
-
-    const validationError = validateSendMessage({
-      chatId,
-      senderId,
-      receiverId,
-      text,
-    });
-    if (validationError) {
-      return res.status(400).json({ success: false, message: validationError });
-    }
-
-    const currentTime = Date.now();
-    const message = {
-      id: currentTime + "_" + senderId,
-      senderId,
-      receiverId,
-      text,
-      sentTime: currentTime,
-      deliveredTime: null,
-      readTime: null,
-    };
-    if (repliedMessageId) {
-      message.repliedMessageId = repliedMessageId;
-    }
-    const userDoc = await addMessageByChatId(chatId, message);
-
-    if (userDoc) {
-      return res.status(200).json({
-        success: true,
-        messageID: message.id,
-      });
-    }
-
-    return res.status(404).json({ success: false, message: "No user found." });
-  } catch (error) {
-    console.error("Error in login:", error.message);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-});
-
-router.post("/editMessage", async (req, res) => {
-  try {
-    const chatId = req.body.chatId;
-    const messageId = req.body.messageId || req.body.id;
-    const senderId = req.body.senderId;
-    const text = req.body.text;
-
-    const validationError = validateMessageRequest({
-      chatId,
-      messageId,
-      senderId,
-    });
-    if (validationError) {
-      return res.status(400).json({ success: false, message: validationError });
-    }
-
-    if (typeof text !== "string") {
-      return res
-        .status(400)
-        .json({ success: false, message: "text is required." });
-    }
-
-    const chat = await getSingleChatByChatId(chatId);
-    if (!chat) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No chat found." });
-    }
-
-    const existingMessage = chat[messageId];
-    if (!existingMessage) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No message found." });
-    }
-
-    if (existingMessage.senderId !== senderId) {
-      return res
-        .status(403)
-        .json({ success: false, message: "Sender is not allowed." });
-    }
-
-    const updatedMessage = {
-      ...existingMessage,
-      text,
-      editedTime: Date.now(),
-    };
-
-    const userDoc = await updateMessageByChatId(
-      chatId,
-      messageId,
-      updatedMessage,
+    const phoneNumber = normalizeString(
+      req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
+    const lastSyncTime = Number(req.body.lastSyncTime || 0);
 
-    if (userDoc) {
-      return res.status(200).json({
-        success: true,
-        messageId: messageId,
-      });
-    }
-
-    return res.status(404).json({ success: false, message: "No chat found." });
-  } catch (error) {
-    console.error("Error in editMessage:", error.message);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-});
-
-router.post("/deleteMessage", async (req, res) => {
-  try {
-    const chatId = req.body.chatId;
-    const messageId = req.body.messageId || req.body.id;
-    const senderId = req.body.senderId;
-
-    const validationError = validateMessageRequest({
-      chatId,
-      messageId,
-      senderId,
-    });
+    const validationError = validateSyncRequest({ phoneNumber, lastSyncTime });
     if (validationError) {
       return res.status(400).json({ success: false, message: validationError });
     }
 
-    const chat = await getSingleChatByChatId(chatId);
-    if (!chat) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No chat found." });
-    }
-
-    const existingMessage = chat[messageId];
-    if (!existingMessage) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No message found." });
-    }
-
-    if (existingMessage.senderId !== senderId) {
-      return res
-        .status(403)
-        .json({ success: false, message: "Sender is not allowed." });
-    }
-
-    const deletedMessage = {
-      ...existingMessage,
-      _text: existingMessage.text,
-      text: "This Message was deleted",
-      deletedTime: Date.now(),
-    };
-
-    const userDoc = await updateMessageByChatId(
-      chatId,
-      messageId,
-      deletedMessage,
-    );
-
-    if (userDoc) {
+    const accountId = formatPhoneNumberForAccountId(phoneNumber);
+    const chatsListDoc = await getChatsListByPhoneNumber(accountId);
+    if (!chatsListDoc) {
       return res.status(200).json({
         success: true,
-        message: deletedMessage,
+        messages: [],
+        syncTime: Date.now(),
       });
     }
 
-    return res.status(404).json({ success: false, message: "No chat found." });
-  } catch (error) {
-    console.error("Error in deleteMessage:", error.message);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-});
-
-router.post("/deleteOpponentMessage", async (req, res) => {
-  try {
-    const chatId = req.body.chatId;
-    const messageId = req.body.messageId || req.body.id;
-
-    const validationError = validateOpponentDeleteRequest({
-      chatId,
-      messageId,
-    });
-    if (validationError) {
-      return res.status(400).json({ success: false, message: validationError });
-    }
-
-    const chat = await getSingleChatByChatId(chatId);
-    if (!chat) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No chat found." });
-    }
-
-    const existingMessage = chat[messageId];
-    if (!existingMessage) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No message found." });
-    }
-
-    const hiddenMessage = {
-      ...existingMessage,
-      visible: "gone",
-    };
-
-    const userDoc = await updateMessageByChatId(
-      chatId,
-      messageId,
-      hiddenMessage,
-    );
-
-    if (userDoc) {
-      return res.status(200).json({
-        success: true,
-        messageId,
-      });
-    }
-
-    return res.status(404).json({ success: false, message: "No chat found." });
-  } catch (error) {
-    console.error("Error in deleteOpponentMessage:", error.message);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-});
-
-router.post("/replyMessage", async (req, res) => {
-  try {
-    const chatId = req.body.chatId;
-    const messageId = req.body.messageId || req.body.id;
-    const senderId = req.body.senderId;
-    const receiverId = req.body.receiverId;
-    const text = req.body.text;
-    const repliedMessageId = req.body.repliedMessageId;
-
-    const validationError = validateReplyMessageRequest({
-      chatId,
-      repliedMessageId,
-    });
-    if (validationError) {
-      return res.status(400).json({ success: false, message: validationError });
-    }
-
-    const chat = await getSingleChatByChatId(chatId);
-    if (!chat) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No chat found." });
-    }
-
-    if (!chat[repliedMessageId]) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No replied message found." });
-    }
-
-    if (!messageId) {
-      const sendValidationError = validateSendMessage({
+    const chatIds = getChatIdsFromChatList(chatsListDoc.list);
+    const chatDocs = await Promise.all(
+      chatIds.map(async (chatId) => ({
         chatId,
-        senderId,
-        receiverId,
-        text,
-      });
-      if (sendValidationError) {
-        return res
-          .status(400)
-          .json({ success: false, message: sendValidationError });
-      }
-
-      const currentTime = Date.now();
-      const replyMessage = {
-        id: currentTime + "_" + senderId,
-        senderId,
-        receiverId,
-        text,
-        repliedMessageId,
-        sentTime: currentTime,
-        deliveredTime: null,
-        readTime: null,
-      };
-      const userDoc = await addMessageByChatId(chatId, replyMessage);
-
-      if (userDoc) {
-        return res.status(200).json({
-          success: true,
-          messageID: replyMessage.id,
-          repliedMessageId,
-        });
-      }
-
-      return res
-        .status(404)
-        .json({ success: false, message: "No chat found." });
-    }
-
-    const existingMessage = chat[messageId];
-    if (!existingMessage) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No message found." });
-    }
-
-    const updatedMessage = {
-      ...existingMessage,
-      repliedMessageId,
-    };
-
-    const userDoc = await updateMessageByChatId(
-      chatId,
-      messageId,
-      updatedMessage,
+        chat: await getSingleChatByChatId(chatId),
+      })),
     );
 
-    if (userDoc) {
-      return res.status(200).json({
-        success: true,
-        messageId,
-        repliedMessageId,
-      });
-    }
+    const normalizedAccountId = normalizePhoneNumberForChatId(accountId);
+    const messages = chatDocs
+      .flatMap(({ chatId, chat }) =>
+        getMessagesFromChatDocument(
+          chat,
+          chatId,
+          normalizedAccountId,
+          lastSyncTime,
+        ),
+      )
+      .sort((a, b) => a.sentTime - b.sentTime);
 
-    return res.status(404).json({ success: false, message: "No chat found." });
+    return res.status(200).json({
+      success: true,
+      messages,
+      syncTime: Date.now(),
+    });
   } catch (error) {
-    console.error("Error in replyMessage:", error.message);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-});
-
-router.post("/deliveredMessage", async (req, res) => {
-  try {
-    const chatId = req.body.chatId;
-    const messageIds = req.body.messageIds || req.body.messageIdList;
-
-    const validationError = validateMessageIdsRequest({ chatId, messageIds });
-    if (validationError) {
-      return res.status(400).json({ success: false, message: validationError });
-    }
-
-    const chat = await getSingleChatByChatId(chatId);
-    if (!chat) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No chat found." });
-    }
-
-    const missingMessageId = findMissingMessageId(chat, messageIds);
-    if (missingMessageId) {
-      return res.status(404).json({
-        success: false,
-        message: `No message found: ${missingMessageId}`,
-      });
-    }
-
-    const deliveredTime = Date.now();
-    const userDoc = await updateMessagesByChatId(
-      chatId,
-      buildMessagesWithTime(chat, messageIds, "deliveredTime", deliveredTime),
-    );
-
-    if (userDoc) {
-      return res.status(200).json({
-        success: true,
-        messageIds,
-        deliveredTime,
-      });
-    }
-
-    return res.status(404).json({ success: false, message: "No chat found." });
-  } catch (error) {
-    console.error("Error in deliveredMessage:", error.message);
-    return res.status(400).json({ success: false, message: error.message });
-  }
-});
-
-router.post("/seenMessage", async (req, res) => {
-  try {
-    const chatId = req.body.chatId;
-    const messageIds = req.body.messageIds || req.body.messageIdList;
-
-    const validationError = validateMessageIdsRequest({ chatId, messageIds });
-    if (validationError) {
-      return res.status(400).json({ success: false, message: validationError });
-    }
-
-    const chat = await getSingleChatByChatId(chatId);
-    if (!chat) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No chat found." });
-    }
-
-    const missingMessageId = findMissingMessageId(chat, messageIds);
-    if (missingMessageId) {
-      return res.status(404).json({
-        success: false,
-        message: `No message found: ${missingMessageId}`,
-      });
-    }
-
-    const readTime = Date.now();
-    const userDoc = await updateMessagesByChatId(
-      chatId,
-      buildMessagesWithTime(chat, messageIds, "readTime", readTime),
-    );
-
-    if (userDoc) {
-      return res.status(200).json({
-        success: true,
-        messageIds,
-        readTime,
-      });
-    }
-
-    return res.status(404).json({ success: false, message: "No chat found." });
-  } catch (error) {
-    console.error("Error in seenMessage:", error.message);
+    console.error("Error in sync:", error.message);
     return res.status(400).json({ success: false, message: error.message });
   }
 });
@@ -524,56 +154,11 @@ async function getSingleChatByChatId(chatId) {
 
 async function getUserByPhoneNumber(phoneNumber) {
   try {
-    const userDoc = await firestoreManager.readDocument("Users", phoneNumber, "/");
-    return userDoc || false;
-  } catch (error) {
-    return false;
-  }
-}
-
-async function addMessageByChatId(chatId, message) {
-  try {
-    const userDoc = await firestoreManager.updateDocument(
-      "Chats",
-      chatId,
+    const userDoc = await firestoreManager.readDocument(
+      "Users",
+      phoneNumber,
       "/",
-      {
-        [message.id]: message,
-      },
     );
-
-    return userDoc || false;
-  } catch (error) {
-    return false;
-  }
-}
-
-async function updateMessageByChatId(chatId, messageId, message) {
-  try {
-    const userDoc = await firestoreManager.updateDocument(
-      "Chats",
-      chatId,
-      "/",
-      {
-        [messageId]: message,
-      },
-    );
-
-    return userDoc || false;
-  } catch (error) {
-    return false;
-  }
-}
-
-async function updateMessagesByChatId(chatId, messages) {
-  try {
-    const userDoc = await firestoreManager.updateDocument(
-      "Chats",
-      chatId,
-      "/",
-      messages,
-    );
-
     return userDoc || false;
   } catch (error) {
     return false;
@@ -629,6 +214,51 @@ function getChatIdFromChatListItem(chatListItem) {
   return chatListItem.chatId || chatListItem.id || chatListItem._id || "";
 }
 
+function getChatIdsFromChatList(chatList) {
+  if (!Array.isArray(chatList)) {
+    return [];
+  }
+
+  return chatList.map(getChatIdFromChatListItem).filter(Boolean);
+}
+
+function getMessagesFromChatDocument(
+  chat,
+  chatId,
+  normalizedAccountId,
+  lastSyncTime,
+) {
+  if (!chat || typeof chat !== "object") {
+    return [];
+  }
+
+  return Object.values(chat)
+    .filter((value) =>
+      isChatMessageForSync(value, normalizedAccountId, lastSyncTime),
+    )
+    .map((message) => ({
+      ...message,
+      chatId: message.chatId || chatId,
+    }));
+}
+
+function isChatMessageForSync(value, normalizedAccountId, lastSyncTime) {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  if (!value.id || typeof value.sentTime !== "number") {
+    return false;
+  }
+  if (value.sentTime <= lastSyncTime) {
+    return false;
+  }
+
+  const senderId = normalizePhoneNumberForChatId(value.senderId);
+  const receiverId = normalizePhoneNumberForChatId(value.receiverId);
+
+  return senderId === normalizedAccountId || receiverId === normalizedAccountId;
+}
+
 async function getOtherUserProfileFromChatId(chatId, phoneNumber) {
   const otherPhoneNumber = getOtherPhoneNumberFromChatId(chatId, phoneNumber);
   if (!otherPhoneNumber) {
@@ -675,6 +305,8 @@ async function getUserProfileSummary(phoneNumber) {
       normalizePhoneNumberForChatId(profileData.phoneNumber) ||
       normalizedPhoneNumber,
     profilePhotoUrl: profileData.profilePhotoUrl || null,
+    isOnline: userDoc.isOnline || false,
+    lastSeen: userDoc.lastSeen || Date.now(),
   };
 }
 
@@ -690,93 +322,15 @@ function validatePhoneNumber({ phoneNumber }) {
   return null;
 }
 
-function validateMessageRequest({ chatId, messageId, senderId }) {
-  if (!chatId) {
-    return "chatId is required.";
+function validateSyncRequest({ phoneNumber, lastSyncTime }) {
+  const phoneError = validatePhoneNumber({ phoneNumber });
+  if (phoneError) {
+    return phoneError;
   }
-
-  if (!messageId) {
-    return "messageId is required.";
+  if (!Number.isFinite(lastSyncTime) || lastSyncTime < 0) {
+    return "lastSyncTime must be a non-negative number.";
   }
-
-  if (!senderId) {
-    return "senderId is required.";
-  }
-
   return null;
 }
 
-function validateOpponentDeleteRequest({ chatId, messageId }) {
-  if (!chatId) {
-    return "chatId is required.";
-  }
-
-  if (!messageId) {
-    return "messageId is required.";
-  }
-
-  return null;
-}
-
-function validateReplyMessageRequest({ chatId, repliedMessageId }) {
-  if (!chatId) {
-    return "chatId is required.";
-  }
-
-  if (!repliedMessageId) {
-    return "repliedMessageId is required.";
-  }
-
-  return null;
-}
-
-function validateMessageIdsRequest({ chatId, messageIds }) {
-  if (!chatId) {
-    return "chatId is required.";
-  }
-
-  if (!Array.isArray(messageIds) || messageIds.length === 0) {
-    return "messageIds must be a non-empty array.";
-  }
-
-  if (messageIds.some((messageId) => !messageId)) {
-    return "messageIds must not contain empty values.";
-  }
-
-  return null;
-}
-
-function validateSendMessage({ chatId, senderId, receiverId, text }) {
-  if (!chatId) {
-    return "chatId is required.";
-  }
-
-  if (!senderId) {
-    return "senderId is required.";
-  }
-
-  if (!receiverId) {
-    return "receiverId is required.";
-  }
-
-  if (!text) {
-    return "text is required.";
-  }
-
-  return null;
-}
-
-function findMissingMessageId(chat, messageIds) {
-  return messageIds.find((messageId) => !chat[messageId]);
-}
-
-function buildMessagesWithTime(chat, messageIds, fieldName, time) {
-  return messageIds.reduce((messages, messageId) => {
-    messages[messageId] = {
-      ...chat[messageId],
-      [fieldName]: time,
-    };
-    return messages;
-  }, {});
-}
 module.exports = router;
