@@ -20,6 +20,7 @@ const otp = require("./routes/otp");
 const profile = require("./routes/profile");
 const signup = require("./routes/signup");
 const chats = require("./routes/chats.js");
+const auth = require("./routes/auth");
 
 // app.use(express.json());
 app.use(express.json({ limit: "2mb" }));
@@ -30,6 +31,7 @@ app.use("/healthCheck", healthCheck);
 app.use("/login", login);
 app.use("/otp", otp);
 app.use("/signup", signup);
+app.use("/auth", auth);
 
 // Authorization middleware
 const authMiddleware = (req, res, next) => {
