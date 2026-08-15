@@ -15,6 +15,7 @@ if (process.env.PRODUCTION_TYPE === "release") {
 
 // Import routes
 const healthCheck = require("./routes/healthCheck");
+const checkUserExists = require("./routes/checkUserExists");
 const login = require("./routes/login");
 const otp = require("./routes/otp");
 const profile = require("./routes/profile");
@@ -28,6 +29,7 @@ app.use(express.static(path.join(__dirname, "public")));
 
 // Use routes without authorization
 app.use("/healthCheck", healthCheck);
+app.use("/checkUserExists", checkUserExists);
 app.use("/login", login);
 app.use("/otp", otp);
 app.use("/signup", signup);
