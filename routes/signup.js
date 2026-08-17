@@ -13,9 +13,9 @@ router.post("/", async (req, res) => {
     const phoneNumber = normalizeString(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
-    const description = normalizeString(req.body.description);
+    const email = normalizeString(req.body.email).toLowerCase();
 
-    const validationError = validateSignup({ name, phoneNumber, description });
+    const validationError = validateSignup({ name, phoneNumber, email });
     if (validationError) {
       return res.status(400).json({ success: false, message: validationError });
     }
@@ -36,9 +36,11 @@ router.post("/", async (req, res) => {
     const profileData = {
       name,
       phoneNumber: accountId,
-      description,
       P_ID,
     };
+    if (email) {
+      profileData.email = email;
+    }
 
     const userModel = new UserModel(
       accountId,
@@ -89,21 +91,18 @@ async function getUserByPhoneNumber(phoneNumber) {
   }
 }
 
-function validateSignup({ name, phoneNumber, description }) {
+function validateSignup({ name, phoneNumber, email }) {
   if (!name) {
     return "name is required.";
   }
   if (!phoneNumber) {
     return "phoneNumber is required.";
   }
-  if (!description) {
-    return "description is required.";
-  }
   if (name.length > 80) {
     return "name is too long.";
   }
-  if (description.length > 500) {
-    return "description is too long.";
+  if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+    return "email must be a valid email address.";
   }
   if (!/^\+?[0-9]{7,15}$/.test(phoneNumber)) {
     return "phoneNumber must contain 7 to 15 digits and may start with +.";

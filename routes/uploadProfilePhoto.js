@@ -26,7 +26,7 @@ router.post("/", async (req, res) => {
     }
 
     const imageBuffer = Buffer.from(profilePhotoBase64, "base64");
-    const uploadsDir = path.join(__dirname, "..", "public", "profile_photos");
+    const uploadsDir = path.join(__dirname, "..", "..", "..", "PinggoServerNode", "public", "profile_photos");
     await fs.mkdir(uploadsDir, { recursive: true });
 
     const fileName = `${safeFileName(uid)}.jpg`;
