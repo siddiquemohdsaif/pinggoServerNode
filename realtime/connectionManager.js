@@ -49,19 +49,7 @@ module.exports = {
 
 function normalizeAccountId(value) {
   const normalized = typeof value === "string" ? value.trim() : "";
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.startsWith("<plus>")) {
-    return normalized;
-  }
-  if (normalized.startsWith("+")) {
-    return `<plus>${normalized.slice(1)}`;
-  }
-  if (/^[0-9]{7,15}$/.test(normalized)) {
-    return `<plus>${normalized}`;
-  }
-  return normalized;
+  return normalized.replace(/^<plus>/, "").replace(/^\+/, "");
 }
 
 function normalizePhoneNumberForChatId(value) {

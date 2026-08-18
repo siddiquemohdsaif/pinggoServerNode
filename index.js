@@ -25,7 +25,7 @@ const auth = require("./routes/auth");
 
 // app.use(express.json());
 app.use(express.json({ limit: "2mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "..", "..", "PinggoServerNode", "public")));
 
 // Use routes without authorization
 app.use("/healthCheck", healthCheck);

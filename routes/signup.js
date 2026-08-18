@@ -10,7 +10,7 @@ const router = express.Router();
 router.post("/", async (req, res) => {
   try {
     const name = normalizeString(req.body.name);
-    const phoneNumber = normalizeString(
+    const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
     const email = normalizeString(req.body.email).toLowerCase();
@@ -72,10 +72,11 @@ function normalizeString(value) {
 }
 
 function formatPhoneNumberForAccountId(phoneNumber) {
-  if (phoneNumber.startsWith("+")) {
-    return `<plus>${phoneNumber.slice(1)}`;
-  }
-  return phoneNumber;
+  return normalizePhoneNumber(phoneNumber);
+}
+
+function normalizePhoneNumber(value) {
+  return normalizeString(value).replace(/^<plus>/, "").replace(/^\+/, "");
 }
 
 async function getUserByPhoneNumber(phoneNumber) {
@@ -104,8 +105,8 @@ function validateSignup({ name, phoneNumber, email }) {
   if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
     return "email must be a valid email address.";
   }
-  if (!/^\+?[0-9]{7,15}$/.test(phoneNumber)) {
-    return "phoneNumber must contain 7 to 15 digits and may start with +.";
+  if (!/^[0-9]{7,15}$/.test(phoneNumber)) {
+    return "phoneNumber must contain 7 to 15 digits.";
   }
   return null;
 }

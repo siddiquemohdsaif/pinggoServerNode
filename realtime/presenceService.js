@@ -148,17 +148,7 @@ function getOtherUserIdFromChatId(chatId, userId) {
 }
 
 function normalizeAccountId(value) {
-  const normalized = normalizeString(value);
-  if (normalized.startsWith("<plus>")) {
-    return normalized;
-  }
-  if (normalized.startsWith("+")) {
-    return `<plus>${normalized.slice(1)}`;
-  }
-  if (/^[0-9]{7,15}$/.test(normalized)) {
-    return `<plus>${normalized}`;
-  }
-  return normalized;
+  return normalizePhoneNumberForChatId(value);
 }
 
 function normalizePhoneNumberForChatId(value) {

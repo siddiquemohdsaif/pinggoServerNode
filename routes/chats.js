@@ -5,7 +5,7 @@ const router = express.Router();
 
 router.post("/list", async (req, res) => {
   try {
-    const phoneNumber = normalizeString(
+    const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
 
@@ -38,7 +38,7 @@ router.post("/list", async (req, res) => {
 
 router.post("/getChat", async (req, res) => {
   try {
-    const phoneNumber = normalizeString(
+    const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
 
@@ -79,7 +79,7 @@ router.post("/getChat", async (req, res) => {
 
 router.post("/sync", async (req, res) => {
   try {
-    const phoneNumber = normalizeString(
+    const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
     const lastSyncTime = Number(req.body.lastSyncTime || 0);
@@ -132,7 +132,7 @@ router.post("/sync", async (req, res) => {
 
 router.post("/discover", async (req, res) => {
   try {
-    const phoneNumber = normalizeString(
+    const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
     const contacts = Array.isArray(req.body.contacts)
@@ -238,18 +238,15 @@ function normalizeString(value) {
 }
 
 function formatPhoneNumberForAccountId(phoneNumber) {
-  if (phoneNumber.startsWith("+")) {
-    return `<plus>${phoneNumber.slice(1)}`;
-  }
-  return phoneNumber;
+  return normalizePhoneNumber(phoneNumber);
 }
 
 function normalizePhoneNumberForChatId(phoneNumber) {
-  if (!phoneNumber) {
-    return "";
-  }
+  return normalizePhoneNumber(phoneNumber);
+}
 
-  return phoneNumber.replace("<plus>", "").replace(/^\+/, "");
+function normalizePhoneNumber(value) {
+  return normalizeString(value).replace(/^<plus>/, "").replace(/^\+/, "");
 }
 
 function getOtherPhoneNumberFromChatId(chatId, phoneNumber) {
@@ -380,7 +377,6 @@ async function getOtherUserProfilesFromChatList(chatList, phoneNumber) {
 async function getUserProfileSummary(phoneNumber) {
   const normalizedPhoneNumber = normalizePhoneNumberForChatId(phoneNumber);
   const userDoc =
-    (await getUserByPhoneNumber(`<plus>${normalizedPhoneNumber}`)) ||
     (await getUserByPhoneNumber(normalizedPhoneNumber)) ||
     (await getUserByPhoneNumber(phoneNumber));
   if (!userDoc) {
@@ -403,8 +399,8 @@ function validatePhoneNumber({ phoneNumber }) {
     return "phoneNumber is required.";
   }
 
-  if (!/^\+?[0-9]{7,15}$/.test(phoneNumber)) {
-    return "phoneNumber must contain 7 to 15 digits and may start with +.";
+  if (!/^[0-9]{7,15}$/.test(phoneNumber)) {
+    return "phoneNumber must contain 7 to 15 digits.";
   }
 
   return null;

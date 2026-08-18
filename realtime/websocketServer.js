@@ -230,17 +230,13 @@ function parseAuthorizationToken(value) {
   }
 
   return {
-    userId: token.slice(0, separatorIndex),
+    userId: normalizeAccountId(token.slice(0, separatorIndex)),
     encryptedCredential: token.slice(separatorIndex + 1),
   };
 }
 
 function normalizeAccountId(value) {
-  const normalized = normalizeString(value);
-  if (normalized.startsWith("+")) {
-    return `<plus>${normalized.slice(1)}`;
-  }
-  return normalized;
+  return normalizeString(value).replace(/^<plus>/, "").replace(/^\+/, "");
 }
 
 function normalizeString(value) {
