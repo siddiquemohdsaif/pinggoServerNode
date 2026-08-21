@@ -1,8 +1,7 @@
 const express = require("express");
-const path = require("path");
-const fs = require("fs").promises;
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const AES = require("../utils/AES_256");
+const { saveFile } = require("../utils/fileStorage");
 
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
@@ -25,15 +24,17 @@ router.post("/", async (req, res) => {
       return res.status(404).json({ success: false, message: "No user found." });
     }
 
-    const imageBuffer = Buffer.from(profilePhotoBase64, "base64");
-    const uploadsDir = path.join(__dirname, "..", "..", "..", "PinggoServerNode", "public", "profile_photos");
-    await fs.mkdir(uploadsDir, { recursive: true });
-
-    const fileName = `${safeFileName(uid)}.jpg`;
-    const filePath = path.join(uploadsDir, fileName);
-    await fs.writeFile(filePath, imageBuffer);
-
-    const profilePhotoUrl = `${getPublicProtocol(req)}://${req.get("host")}/pinggo-app-api/profile_photos/${fileName}`;
+    const fileName = `${safeFileName(uid)}--${Date.now()}.jpg`;
+    const savedFile = await saveFile({
+      buffer: Buffer.from(profilePhotoBase64, "base64"),
+      requestedPath: `profile_photos/${fileName}`,
+      originalName: fileName,
+      mimeType: "image/jpeg",
+    });
+    const publicBaseUrl = process.env.PUBLIC_BASE_URL
+      ? process.env.PUBLIC_BASE_URL.replace(/\/$/, "")
+      : `${getPublicProtocol(req)}://${req.get("host")}${(process.env.PUBLIC_PATH_PREFIX || "/pinggo-app-api").replace(/\/$/, "")}`;
+    const profilePhotoUrl = `${publicBaseUrl}${savedFile.publicPath}`;
     const updatedUserData = {
       ...userData,
       profileData: {

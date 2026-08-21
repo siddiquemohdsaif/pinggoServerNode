@@ -3,11 +3,11 @@ const FirestoreManager = require("./Firestore/FirestoreManager");
 const firestoreManager = FirestoreManager.getInstance();
 
 const COLLECTIONS_TO_CLEAN = [
-    "P-ID-MAP",
-    "EmailOtp",
-    "Chats",
-    "Users",
-    "ChatsList",
+    // "P-ID-MAP",
+    // "EmailOtp",
+    // "Chats",
+    // "Users",
+    // "ChatsList",
 ];
 
 const cleanCollection = async (collectionName) => {
