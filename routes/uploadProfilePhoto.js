@@ -1,10 +1,13 @@
 const express = require("express");
+const sharp = require("sharp");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const AES = require("../utils/AES_256");
-const { saveFile } = require("../utils/fileStorage");
+const { deleteFile, saveFile } = require("../utils/fileStorage");
 
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
+const MAX_PROFILE_PHOTO_BYTES = 5 * 1024 * 1024;
+const SUPPORTED_IMAGE_FORMATS = new Set(["jpeg", "png", "webp"]);
 
 router.post("/", async (req, res) => {
   try {
@@ -24,12 +27,35 @@ router.post("/", async (req, res) => {
       return res.status(404).json({ success: false, message: "No user found." });
     }
 
-    const fileName = `${safeFileName(uid)}--${Date.now()}.jpg`;
+    const sourceBuffer = Buffer.from(profilePhotoBase64, "base64");
+    if (sourceBuffer.length > MAX_PROFILE_PHOTO_BYTES) {
+      return res.status(413).json({
+        success: false,
+        message: "Profile photo must be 5 MB or smaller.",
+      });
+    }
+
+    if (!(await isSupportedImage(sourceBuffer))) {
+      return res.status(400).json({
+        success: false,
+        message: "Profile photo must be a valid JPEG, PNG, or WebP image.",
+      });
+    }
+
+    const processedImage = await sharp(sourceBuffer, {
+      failOn: "error",
+      limitInputPixels: 40_000_000,
+    })
+      .rotate()
+      .resize({ width: 1024, height: 1024, fit: "inside", withoutEnlargement: true })
+      .webp({ quality: 82 })
+      .toBuffer();
+    const fileName = `${safeFileName(uid)}--${Date.now()}.webp`;
     const savedFile = await saveFile({
-      buffer: Buffer.from(profilePhotoBase64, "base64"),
-      requestedPath: `profile_photos/${fileName}`,
+      buffer: processedImage,
+      requestedPath: `profile_photo/${fileName}`,
       originalName: fileName,
-      mimeType: "image/jpeg",
+      mimeType: "image/webp",
     });
     const publicBaseUrl = process.env.PUBLIC_BASE_URL
       ? process.env.PUBLIC_BASE_URL.replace(/\/$/, "")
@@ -44,7 +70,19 @@ router.post("/", async (req, res) => {
     };
     delete updatedUserData._id;
 
-    await firestoreManager.updateDocument("Users", uid, "/", updatedUserData);
+    try {
+      await firestoreManager.updateDocument("Users", uid, "/", updatedUserData);
+    } catch (error) {
+      await deleteFile(savedFile.fullPath).catch(() => null);
+      throw error;
+    }
+
+    const previousPhotoPath = getManagedProfilePhotoPath(userData.profileData?.profilePhotoUrl);
+    if (previousPhotoPath && previousPhotoPath !== savedFile.fullPath) {
+      await deleteFile(previousPhotoPath).catch((error) => {
+        console.error("Could not delete previous profile photo:", error.message);
+      });
+    }
 
     return res.status(200).json({
       success: true,
@@ -75,6 +113,33 @@ function validateProfilePhoto(profilePhotoBase64) {
     return "profilePhotoBase64 is not valid.";
   }
   return null;
+}
+
+async function isSupportedImage(imageBuffer) {
+  try {
+    const metadata = await sharp(imageBuffer, {
+      failOn: "error",
+      limitInputPixels: 40_000_000,
+    }).metadata();
+    return Boolean(
+      SUPPORTED_IMAGE_FORMATS.has(metadata.format) && metadata.width && metadata.height,
+    );
+  } catch (_error) {
+    return false;
+  }
+}
+
+function getManagedProfilePhotoPath(photoUrl) {
+  if (typeof photoUrl !== "string" || !photoUrl) return null;
+  try {
+    const pathname = new URL(photoUrl, "http://local").pathname;
+    const match = decodeURIComponent(pathname).match(
+      /\/(?:files\/)?(profile_photos?\/[a-zA-Z0-9._-]+)$/,
+    );
+    return match ? match[1] : null;
+  } catch (_error) {
+    return null;
+  }
 }
 
 function safeFileName(value) {
