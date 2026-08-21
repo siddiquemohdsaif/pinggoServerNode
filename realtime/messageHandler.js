@@ -13,12 +13,18 @@ async function handleSendMessage(ws, payload, sendJson) {
   const receiverId = normalizeAccountId(payload.receiverId);
   const text = normalizeString(payload.text);
   const repliedMessageId = normalizeString(payload.repliedMessageId);
+  const messageType = normalizeString(payload.messageType || "text").toLowerCase();
+  const attachmentId = normalizeString(payload.attachmentId);
+  const location = normalizeLocation(payload.location);
 
   const validationError = validateSendMessage({
     chatId,
     senderId,
     receiverId,
     text,
+    messageType,
+    attachmentId,
+    location,
   });
   if (validationError) {
     sendMessageFailed(ws, sendJson, {
@@ -38,6 +44,43 @@ async function handleSendMessage(ws, payload, sendJson) {
     return;
   }
 
+  // A client retains send_message until it receives message_ack. If the socket
+  // drops after persistence but before the ack arrives, acknowledge the
+  // existing record instead of creating a duplicate or rejecting its now-used
+  // attachment.
+  if (clientMessageId) {
+    const existingChat = await getChat(chatId);
+    const existingMessage = existingChat && Object.values(existingChat).find((item) =>
+      item && item.clientMessageId === clientMessageId
+      && normalizeAccountId(item.senderId) === senderId,
+    );
+    if (existingMessage) {
+      sendJson(ws, {
+        type: "message_ack",
+        clientMessageId,
+        messageId: existingMessage.id,
+        chatId,
+        status: "sent",
+        sentTime: existingMessage.sentTime,
+        message: existingMessage,
+      });
+      return;
+    }
+  }
+
+  let attachment = null;
+  if (["image", "video", "file"].includes(messageType)) {
+    try {
+      attachment = await firestoreManager.readDocument("ChatAttachments", attachmentId, "/");
+    } catch (_error) {
+      attachment = null;
+    }
+    if (!attachment || attachment.chatId !== chatId || normalizeAccountId(attachment.uploaderId) !== senderId || attachment.status !== "pending" || attachment.kind !== messageType) {
+      sendMessageFailed(ws, sendJson, { clientMessageId, chatId, message: "Attachment is invalid or unavailable." });
+      return;
+    }
+  }
+
   const sentTime = Date.now();
   const messageId = `${sentTime}_${senderId}`;
   const message = {
@@ -47,6 +90,7 @@ async function handleSendMessage(ws, payload, sendJson) {
     senderId,
     receiverId,
     text,
+    messageType,
     sentTime,
     deliveredTime: null,
     readTime: null,
@@ -56,26 +100,33 @@ async function handleSendMessage(ws, payload, sendJson) {
   if (repliedMessageId) {
     message.repliedMessageId = repliedMessageId;
   }
+  if (attachment) {
+    message.attachment = {
+      id: attachment.id || attachmentId,
+      kind: attachment.kind,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      url: attachment.url,
+    };
+  }
+  if (messageType === "location") message.location = location;
 
   try {
     await ensureChatReadyForMessage(chatId, senderId, receiverId);
     await saveMessage(chatId, message);
+    if (attachment) {
+      const updatedAttachment = { ...attachment, status: "attached", messageId, attachedTime: sentTime };
+      delete updatedAttachment._id;
+      firestoreManager
+        .updateDocument("ChatAttachments", attachmentId, "/", updatedAttachment)
+        .catch(() => null);
+    }
     const receiverSocket = getUserSocket(receiverId);
     const receiverOnline = Boolean(receiverSocket);
 
-    let offlineNotification = null;
-    if (receiverSocket) {
-      sendJson(receiverSocket, {
-        type: "new_message",
-        message,
-      });
-    } else {
-      offlineNotification = await sendFcmWithoutFailingMessage({
-        receiverId,
-        message,
-      });
-    }
-
+    // Acknowledge the sender as soon as the message is safely stored. Receiver delivery and
+    // offline notification are independent and must never keep the sender in "sending" state.
     sendJson(ws, {
       type: "message_ack",
       clientMessageId: clientMessageId || null,
@@ -84,9 +135,17 @@ async function handleSendMessage(ws, payload, sendJson) {
       status: "sent",
       sentTime,
       receiverOnline,
-      offlineNotification,
       message,
     });
+
+    if (receiverSocket) {
+      sendJson(receiverSocket, {
+        type: "new_message",
+        message,
+      });
+    } else {
+      sendFcmWithoutFailingMessage({ receiverId, message });
+    }
   } catch (error) {
     sendMessageFailed(ws, sendJson, {
       clientMessageId,
@@ -665,7 +724,7 @@ function validateOpponentDeleteMessage({ chatId, messageId }) {
   return null;
 }
 
-function validateSendMessage({ chatId, senderId, receiverId, text }) {
+function validateSendMessage({ chatId, senderId, receiverId, text, messageType, attachmentId, location }) {
   if (!chatId) {
     return "chatId is required.";
   }
@@ -675,10 +734,30 @@ function validateSendMessage({ chatId, senderId, receiverId, text }) {
   if (!receiverId) {
     return "receiverId is required.";
   }
-  if (!text) {
+  if (!["text", "image", "video", "file", "location"].includes(messageType)) {
+    return "messageType must be text, image, video, file, or location.";
+  }
+  if (messageType === "text" && !text) {
     return "text is required.";
   }
+  if (["image", "video", "file"].includes(messageType) && !attachmentId) {
+    return "attachmentId is required.";
+  }
+  if (messageType === "location" && !location) {
+    return "Valid location coordinates are required.";
+  }
   return null;
+}
+
+function normalizeLocation(value) {
+  if (!value || typeof value !== "object") return null;
+  const latitude = Number(value.latitude);
+  const longitude = Number(value.longitude);
+  const accuracy = value.accuracy == null ? null : Number(value.accuracy);
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
+      !Number.isFinite(longitude) || longitude < -180 || longitude > 180 ||
+      (accuracy != null && (!Number.isFinite(accuracy) || accuracy < 0))) return null;
+  return { latitude, longitude, accuracy };
 }
 
 function validateMessageIdsRequest({ chatId, messageIds }) {

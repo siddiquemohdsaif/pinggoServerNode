@@ -2,11 +2,11 @@ const express = require("express");
 const sharp = require("sharp");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const AES = require("../utils/AES_256");
-const { deleteFile, saveFile } = require("../utils/fileStorage");
+const { deleteFile, maxFileSizeMb, saveFile } = require("../utils/fileStorage");
 
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
-const MAX_PROFILE_PHOTO_BYTES = 5 * 1024 * 1024;
+const MAX_PROFILE_PHOTO_BYTES = maxFileSizeMb * 1024 * 1024;
 const SUPPORTED_IMAGE_FORMATS = new Set(["jpeg", "png", "webp"]);
 
 router.post("/", async (req, res) => {
@@ -31,7 +31,7 @@ router.post("/", async (req, res) => {
     if (sourceBuffer.length > MAX_PROFILE_PHOTO_BYTES) {
       return res.status(413).json({
         success: false,
-        message: "Profile photo must be 5 MB or smaller.",
+        message: `Profile photo must be ${maxFileSizeMb} MB or smaller.`,
       });
     }
 

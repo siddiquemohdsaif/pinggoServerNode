@@ -22,6 +22,7 @@ const signup = require("./routes/signup");
 const chats = require("./routes/chats.js");
 const auth = require("./routes/auth");
 const files = require("./routes/files");
+const chatAttachments = require("./routes/chatAttachments");
 const { maxFileSizeMb, uploadDir } = require("./utils/fileStorage");
 
 // app.use(express.json());
@@ -51,6 +52,7 @@ const authMiddleware = (req, res, next) => {
 const authorizedRoutes = express.Router();
 authorizedRoutes.use(authMiddleware); // Apply the middleware
 authorizedRoutes.use("/profile", profile);
+authorizedRoutes.use("/chats/attachments", chatAttachments);
 authorizedRoutes.use("/chats", chats);
 
 app.use("/", authorizedRoutes); // Use the grouped routes

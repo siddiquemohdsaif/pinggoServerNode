@@ -106,6 +106,7 @@ module.exports = {
   deleteFile,
   getFile,
   maxFileSizeMb,
+  resolveUploadPath,
   saveFile,
   uploadDir,
 };

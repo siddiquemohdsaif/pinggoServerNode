@@ -24,9 +24,7 @@ function createWebSocketServer(server) {
   const wss = new WebSocketServer({ server, path: "/ws" });
 
   wss.on("connection", (ws, req) => {
-    const remoteAddress = req.socket.remoteAddress;
     ws.authorization = req.headers.authorization || "";
-    console.log(`WebSocket connected: ${remoteAddress}`);
 
     ws.send(
       JSON.stringify({
@@ -37,7 +35,6 @@ function createWebSocketServer(server) {
 
     ws.on("message", (rawMessage) => {
       handleMessage(ws, rawMessage).catch((error) => {
-        console.error("WebSocket message error:", error.message);
         sendJson(ws, {
           type: "error",
           message: "Unable to process WebSocket message.",
@@ -47,18 +44,12 @@ function createWebSocketServer(server) {
 
     ws.on("close", () => {
       removeUser(ws.userId, ws);
-      handleDisconnect(ws).catch((error) => {
-        console.error("WebSocket disconnect error:", error.message);
-      });
-      console.log(`WebSocket disconnected: ${remoteAddress}`);
+      handleDisconnect(ws).catch(() => null);
     });
 
-    ws.on("error", (error) => {
-      console.error("WebSocket error:", error.message);
-    });
+    ws.on("error", () => {});
   });
 
-  console.log("WebSocket server is ready on /ws");
   return wss;
 }
 
@@ -163,22 +154,25 @@ async function handleAuth(ws, message) {
   }
 
   addUser(credentials.userId, ws);
-  await markUserOnline(credentials.userId);
   sendJson(ws, {
     type: "auth_success",
     userId: credentials.userId,
     onlineUserCount: getOnlineUserCount(),
   });
-  await notifyPresenceToContacts(
-    credentials.userId,
-    {
-      type: "online_status",
-      userId: credentials.userId,
-      isOnline: true,
-      lastSeen: Date.now(),
-    },
-    sendJson,
-  );
+
+  try {
+    await markUserOnline(credentials.userId);
+    await notifyPresenceToContacts(
+      credentials.userId,
+      {
+        type: "online_status",
+        userId: credentials.userId,
+        isOnline: true,
+        lastSeen: Date.now(),
+      },
+      sendJson,
+    );
+  } catch (_error) {}
 }
 
 async function handleDisconnect(ws) {
