@@ -572,6 +572,30 @@ async function saveMessage(chatId, message) {
   return result;
 }
 
+async function saveCallMessage({ callId, chatId, callerId, receiverId, text, durationSeconds }, sendJson) {
+  if (!callId || !chatId || !callerId || !receiverId || !text) return null;
+  const existingChat = await getChat(chatId);
+  const existingMessage = existingChat && Object.values(existingChat).find((item) =>
+    item && item.callId === callId && item.messageType === "voice_call",
+  );
+  if (existingMessage) return existingMessage;
+  const sentTime = Date.now();
+  const message = {
+    id: `call_${callId}`, clientMessageId: null, callId, chatId,
+    senderId: callerId, receiverId, text, messageType: "voice_call",
+    callDurationSeconds: durationSeconds, sentTime, deliveredTime: null,
+    readTime: null, status: "sent",
+  };
+  await ensureChatReadyForMessage(chatId, callerId, receiverId);
+  await saveMessage(chatId, message);
+  for (const userId of [callerId, receiverId]) {
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, { type: "new_message", message });
+  }
+  if (!getUserSocket(receiverId)) sendFcmWithoutFailingMessage({ receiverId, message });
+  return message;
+}
+
 async function ensureChatReadyForMessage(chatId, senderId, receiverId) {
   const chat = await getChat(chatId);
   if (!chat) {
@@ -795,4 +819,5 @@ module.exports = {
   handleEditMessage,
   handleSendMessage,
   handleSeenMessage,
+  saveCallMessage,
 };

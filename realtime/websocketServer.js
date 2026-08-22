@@ -19,6 +19,11 @@ const {
   markUserOnline,
   notifyPresenceToContacts,
 } = require("./presenceService");
+const {
+  handleCallEvent,
+  deliverPendingCallsForUser,
+  handleCallDisconnect,
+} = require("./callHandler");
 
 function createWebSocketServer(server) {
   const wss = new WebSocketServer({ server, path: "/ws" });
@@ -43,6 +48,7 @@ function createWebSocketServer(server) {
     });
 
     ws.on("close", () => {
+      handleCallDisconnect(ws.userId, sendJson).catch(() => null);
       removeUser(ws.userId, ws);
       handleDisconnect(ws).catch(() => null);
     });
@@ -121,6 +127,10 @@ async function handleMessage(ws, rawMessage) {
     return;
   }
 
+  if (message.type.startsWith("call_") || message.type === "ice_candidate") {
+    if (await handleCallEvent(ws, message, sendJson)) return;
+  }
+
   sendJson(ws, {
     type: "event_received",
     receivedType: message.type,
@@ -159,6 +169,7 @@ async function handleAuth(ws, message) {
     userId: credentials.userId,
     onlineUserCount: getOnlineUserCount(),
   });
+  deliverPendingCallsForUser(credentials.userId, sendJson);
 
   try {
     await markUserOnline(credentials.userId);
