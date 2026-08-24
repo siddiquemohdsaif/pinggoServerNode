@@ -25,10 +25,11 @@ const {
   handleCallDisconnect,
 } = require("./callHandler");
 
-function createWebSocketServer(server) {
-  const wss = new WebSocketServer({ server, path: "/ws" });
+function createWebSocketServer() {
+  const wss = new WebSocketServer({ noServer: true });
 
   wss.on("connection", (ws, req) => {
+    console.log(`[signal-socket] connected remote=${req.socket.remoteAddress || "unknown"} time=${Date.now()}`);
     ws.authorization = req.headers.authorization || "";
 
     ws.send(
@@ -48,6 +49,7 @@ function createWebSocketServer(server) {
     });
 
     ws.on("close", () => {
+      console.log(`[signal-socket] closed userId=${ws.userId || "unauthenticated"} time=${Date.now()}`);
       handleCallDisconnect(ws.userId, sendJson).catch(() => null);
       removeUser(ws.userId, ws);
       handleDisconnect(ws).catch(() => null);
@@ -77,6 +79,11 @@ async function handleMessage(ws, rawMessage) {
       message: "Message type is required.",
     });
     return;
+  }
+
+  if (message.type.startsWith("call_") || message.type === "ice_candidate") {
+    console.log(`[signal-event] receive type=${message.type} callId=${message.callId || ""}`
+      + ` userId=${ws.userId || "unauthenticated"} time=${Date.now()}`);
   }
 
   if (message.type === "auth") {
@@ -164,6 +171,7 @@ async function handleAuth(ws, message) {
   }
 
   addUser(credentials.userId, ws);
+  console.log(`[signal-auth] success userId=${credentials.userId} time=${Date.now()}`);
   sendJson(ws, {
     type: "auth_success",
     userId: credentials.userId,

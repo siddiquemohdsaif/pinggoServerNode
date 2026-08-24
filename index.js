@@ -2,6 +2,7 @@ const express = require("express");
 const http = require("http");
 const AES = require("./utils/AES_256");
 const { createWebSocketServer } = require("./realtime/websocketServer");
+const { createMediaWebSocketServer } = require("./realtime/mediaServer");
 const app = express();
 require("dotenv").config();
 
@@ -69,7 +70,35 @@ app.use((error, _req, res, _next) => {
 });
 
 const server = http.createServer(app);
-createWebSocketServer(server);
+const signalingWebSocketServer = createWebSocketServer();
+const mediaWebSocketServer = createMediaWebSocketServer();
+
+server.on("upgrade", (request, socket, head) => {
+  let pathname;
+  try {
+    pathname = new URL(request.url, "http://localhost").pathname;
+  } catch (_error) {
+    socket.destroy();
+    return;
+  }
+
+  const selectedServer = pathname === "/ws"
+    ? signalingWebSocketServer
+    : pathname === "/media"
+      ? mediaWebSocketServer
+      : null;
+
+  console.log(`[ws-upgrade] path=${pathname} accepted=${Boolean(selectedServer)} time=${Date.now()}`);
+
+  if (!selectedServer) {
+    socket.destroy();
+    return;
+  }
+
+  selectedServer.handleUpgrade(request, socket, head, (webSocket) => {
+    selectedServer.emit("connection", webSocket, request);
+  });
+});
 
 server.listen(port, () => {
   console.log(`Server is running on port ${port}`);

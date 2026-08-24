@@ -572,18 +572,24 @@ async function saveMessage(chatId, message) {
   return result;
 }
 
-async function saveCallMessage({ callId, chatId, callerId, receiverId, text, durationSeconds }, sendJson) {
+async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType, text,
+  durationSeconds, createdAt, ringingAt, connectedAt, endedAt, terminationReason }, sendJson) {
   if (!callId || !chatId || !callerId || !receiverId || !text) return null;
   const existingChat = await getChat(chatId);
   const existingMessage = existingChat && Object.values(existingChat).find((item) =>
-    item && item.callId === callId && item.messageType === "voice_call",
+    item && item.callId === callId &&
+      item.messageType === (mediaType === "video" ? "video_call" : "voice_call"),
   );
   if (existingMessage) return existingMessage;
   const sentTime = Date.now();
   const message = {
     id: `call_${callId}`, clientMessageId: null, callId, chatId,
-    senderId: callerId, receiverId, text, messageType: "voice_call",
-    callDurationSeconds: durationSeconds, sentTime, deliveredTime: null,
+    senderId: callerId, receiverId, text,
+    messageType: mediaType === "video" ? "video_call" : "voice_call",
+    callDurationSeconds: durationSeconds, callCreatedAt: createdAt || null,
+    callRingingAt: ringingAt || null, callConnectedAt: connectedAt || null,
+    callEndedAt: endedAt || null, callTerminationReason: terminationReason || "unknown",
+    sentTime, deliveredTime: null,
     readTime: null, status: "sent",
   };
   await ensureChatReadyForMessage(chatId, callerId, receiverId);
