@@ -104,9 +104,12 @@ async function getPresenceForUsers(userIds) {
 async function getChatContactIds(userId) {
   try {
     const chatsListDoc = await firestoreManager.readDocument("ChatsList", userId, "/");
-    const chatList = chatsListDoc && Array.isArray(chatsListDoc.list)
-      ? chatsListDoc.list
-      : [];
+    const storedList = chatsListDoc && chatsListDoc.list;
+    const chatList = Array.isArray(storedList)
+      ? storedList
+      : storedList && typeof storedList === "object"
+        ? Object.keys(storedList)
+        : [];
 
     return chatList
       .map(getChatIdFromChatListItem)

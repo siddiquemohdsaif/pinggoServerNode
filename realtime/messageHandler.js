@@ -55,6 +55,7 @@ async function handleSendMessage(ws, payload, sendJson) {
       && normalizeAccountId(item.senderId) === senderId,
     );
     if (existingMessage) {
+      await updateLastMessageForParticipants(existingMessage).catch(() => null);
       sendJson(ws, {
         type: "message_ack",
         clientMessageId,
@@ -81,8 +82,8 @@ async function handleSendMessage(ws, payload, sendJson) {
     }
   }
 
-  const sentTime = Date.now();
-  const messageId = `${sentTime}_${senderId}`;
+  const sentTime = nextMessageTimestamp();
+  const messageId = String(sentTime);
   const message = {
     id: messageId,
     clientMessageId: clientMessageId || null,
@@ -115,6 +116,8 @@ async function handleSendMessage(ws, payload, sendJson) {
   try {
     await ensureChatReadyForMessage(chatId, senderId, receiverId);
     await saveMessage(chatId, message);
+    await updateLastMessageForParticipants(message);
+    await incrementUnreadCount(receiverId, chatId).catch(() => null);
     if (attachment) {
       const updatedAttachment = { ...attachment, status: "attached", messageId, attachedTime: sentTime };
       delete updatedAttachment._id;
@@ -227,6 +230,7 @@ async function handleSeenMessage(ws, payload, sendJson) {
   }, {});
 
   await updateMessages(chatId, updatedMessages);
+  await clearUnreadCount(ws.userId, chatId).catch(() => null);
 
   sendJson(ws, {
     type: "message_seen_ack",
@@ -580,10 +584,13 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
     item && item.callId === callId &&
       item.messageType === (mediaType === "video" ? "video_call" : "voice_call"),
   );
-  if (existingMessage) return existingMessage;
-  const sentTime = Date.now();
+  if (existingMessage) {
+    await updateLastMessageForParticipants(existingMessage).catch(() => null);
+    return existingMessage;
+  }
+  const sentTime = nextMessageTimestamp();
   const message = {
-    id: `call_${callId}`, clientMessageId: null, callId, chatId,
+    id: String(sentTime), clientMessageId: null, callId, chatId,
     senderId: callerId, receiverId, text,
     messageType: mediaType === "video" ? "video_call" : "voice_call",
     callDurationSeconds: durationSeconds, callCreatedAt: createdAt || null,
@@ -594,12 +601,21 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
   };
   await ensureChatReadyForMessage(chatId, callerId, receiverId);
   await saveMessage(chatId, message);
+  await updateLastMessageForParticipants(message);
+  await incrementUnreadCount(receiverId, chatId).catch(() => null);
   for (const userId of [callerId, receiverId]) {
     const socket = getUserSocket(userId);
     if (socket) sendJson(socket, { type: "new_message", message });
   }
   if (!getUserSocket(receiverId)) sendFcmWithoutFailingMessage({ receiverId, message });
   return message;
+}
+
+let lastMessageTimestamp = 0;
+function nextMessageTimestamp() {
+  const timestamp = Math.max(Date.now(), lastMessageTimestamp + 1);
+  lastMessageTimestamp = timestamp;
+  return timestamp;
 }
 
 async function ensureChatReadyForMessage(chatId, senderId, receiverId) {
@@ -625,16 +641,19 @@ async function createChatDocument(chatId) {
 async function addChatIdToChatsList(userId, chatId) {
   const accountId = normalizeAccountId(userId);
   const existingDoc = await getChatsList(accountId);
-  const list = Array.isArray(existingDoc && existingDoc.list)
-    ? existingDoc.list
-    : [];
-  if (list.includes(chatId)) {
+  const existingList = existingDoc && existingDoc.list;
+  const list = Array.isArray(existingList)
+    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
+    : existingList && typeof existingList === "object"
+      ? existingList
+      : {};
+  if (Object.prototype.hasOwnProperty.call(list, chatId)) {
     return;
   }
 
   const updatedDoc = {
     ...withoutDocumentId(existingDoc || {}),
-    list: [...list, chatId],
+    list: { ...list, [chatId]: defaultChatSettings() },
   };
 
   try {
@@ -646,6 +665,75 @@ async function addChatIdToChatsList(userId, chatId) {
   } catch (error) {
     await firestoreManager.updateDocument("ChatsList", accountId, "/", updatedDoc);
   }
+}
+
+function defaultChatSettings() {
+  return {
+    pinned: false,
+    notification_muted: "0",
+    archieved: false,
+    unread_count: 0,
+    last_message: null,
+  };
+}
+
+async function updateLastMessageForParticipants(message) {
+  await Promise.all([
+    updateLastMessage(message.senderId, message.chatId, message),
+    updateLastMessage(message.receiverId, message.chatId, message),
+  ]);
+}
+
+async function updateLastMessage(userId, chatId, message) {
+  const accountId = normalizeAccountId(userId);
+  const existingDoc = await getChatsList(accountId);
+  if (!existingDoc) return;
+  const existingList = existingDoc.list;
+  const list = Array.isArray(existingList)
+    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
+    : existingList && typeof existingList === "object"
+      ? existingList
+      : {};
+  const settings = { ...defaultChatSettings(), ...(list[chatId] || {}) };
+  const currentLastMessage = settings.last_message;
+  if (
+    currentLastMessage &&
+    Number(currentLastMessage.sentTime) > Number(message.sentTime)
+  ) {
+    return;
+  }
+  settings.last_message = { ...message };
+  await firestoreManager.updateDocument("ChatsList", accountId, "/", {
+    ...withoutDocumentId(existingDoc),
+    list: { ...list, [chatId]: settings },
+  });
+}
+
+async function incrementUnreadCount(userId, chatId) {
+  await updateUnreadCount(userId, chatId, (current) => current + 1);
+}
+
+async function clearUnreadCount(userId, chatId) {
+  await updateUnreadCount(userId, chatId, () => 0);
+}
+
+async function updateUnreadCount(userId, chatId, updater) {
+  const accountId = normalizeAccountId(userId);
+  const existingDoc = await getChatsList(accountId);
+  if (!existingDoc) return;
+  const existingList = existingDoc.list;
+  const list = Array.isArray(existingList)
+    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
+    : existingList && typeof existingList === "object"
+      ? existingList
+      : {};
+  const settings = { ...defaultChatSettings(), ...(list[chatId] || {}) };
+  const current = Number(settings.unread_count) || 0;
+  settings.unread_count = Math.max(0, updater(current));
+  await firestoreManager.updateDocument("ChatsList", accountId, "/", {
+    ...withoutDocumentId(existingDoc),
+    list: { ...list, [chatId]: settings },
+  });
 }
 
 function withoutDocumentId(document) {

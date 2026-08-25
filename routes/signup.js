@@ -51,7 +51,7 @@ router.post("/", async (req, res) => {
     await firestoreManager.createDocument("Users", accountId, "/", userModel);
 
     await firestoreManager.createDocument("ChatsList", accountId, "/", {
-      list: [],
+      list: {},
     });
 
     return res.status(200).json({

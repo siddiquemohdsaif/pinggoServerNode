@@ -50,7 +50,8 @@ router.post("/", async (req, res) => {
       .resize({ width: 1024, height: 1024, fit: "inside", withoutEnlargement: true })
       .webp({ quality: 82 })
       .toBuffer();
-    const fileName = `${safeFileName(uid)}--${Date.now()}.webp`;
+    const profilePhotoTimestamp = Date.now();
+    const fileName = `${safeFileName(uid)}--${profilePhotoTimestamp}.webp`;
     const savedFile = await saveFile({
       buffer: processedImage,
       requestedPath: `profile_photo/${fileName}`,
@@ -60,12 +61,14 @@ router.post("/", async (req, res) => {
     const publicBaseUrl = process.env.PUBLIC_BASE_URL
       ? process.env.PUBLIC_BASE_URL.replace(/\/$/, "")
       : `${getPublicProtocol(req)}://${req.get("host")}${(process.env.PUBLIC_PATH_PREFIX || "/pinggo-app-api").replace(/\/$/, "")}`;
-    const profilePhotoUrl = `${publicBaseUrl}${savedFile.publicPath}`;
+    const profilePhotoUrl =
+      `${publicBaseUrl}${savedFile.publicPath}?v=${profilePhotoTimestamp}`;
     const updatedUserData = {
       ...userData,
       profileData: {
         ...(userData.profileData || {}),
         profilePhotoUrl,
+        profilePhotoTimestamp,
       },
     };
     delete updatedUserData._id;
@@ -87,6 +90,7 @@ router.post("/", async (req, res) => {
     return res.status(200).json({
       success: true,
       profilePhotoUrl,
+      profilePhotoTimestamp,
       userData: {
         ...updatedUserData,
         _id: uid,

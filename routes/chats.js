@@ -4,28 +4,37 @@ const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
 
 router.post("/list", async (req, res) => {
+  const routeStartedAt = process.hrtime.bigint();
   try {
     const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
+    const pageSize = normalizePageSize(req.body.pageSize);
+    const cursor = decodeCursor(req.body.cursor);
 
     const validationError = validatePhoneNumber({ phoneNumber });
     if (validationError) {
       return res.status(400).json({ success: false, message: validationError });
     }
     const accountId = formatPhoneNumberForAccountId(phoneNumber);
+    const chatListReadStartedAt = process.hrtime.bigint();
     const userDoc = await getChatsListByPhoneNumber(accountId);
+    console.log(
+      `[chats/list] chat-list read completed in ${elapsedMilliseconds(chatListReadStartedAt)} ms`,
+    );
 
     if (userDoc) {
+      const page = paginateChatList(userDoc.list, pageSize, cursor);
       const userProfiles = await getOtherUserProfilesFromChatList(
-        userDoc.list,
+        page.chatList,
         phoneNumber,
       );
 
       return res.status(200).json({
         success: true,
-        chatList: userDoc.list,
         userProfiles,
+        nextCursor: page.nextCursor,
+        hasMore: page.hasMore,
       });
     }
 
@@ -33,6 +42,11 @@ router.post("/list", async (req, res) => {
   } catch (error) {
     console.error("Error in login:", error.message);
     return res.status(400).json({ success: false, message: error.message });
+  } finally {
+    console.log(
+      `[chats/list] route completed in ${elapsedMilliseconds(routeStartedAt)} ms` +
+        ` with status ${res.statusCode}`,
+    );
   }
 });
 
@@ -77,6 +91,58 @@ router.post("/getChat", async (req, res) => {
   }
 });
 
+router.post("/settings", async (req, res) => {
+  try {
+    const phoneNumber = normalizePhoneNumber(
+      req.body.phoneNumber || req.body.phone_number || req.body.phone,
+    );
+    const chatId = normalizeString(req.body.chatId);
+    const setting = normalizeString(req.body.setting);
+    const value = Number(req.body.value);
+
+    const validationError = validatePhoneNumber({ phoneNumber }) ||
+      validateChatSetting({ phoneNumber, chatId, setting, value });
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+
+    const chatsListDoc = await getChatsListByPhoneNumber(
+      formatPhoneNumberForAccountId(phoneNumber),
+    );
+    const existingList = chatsListDoc && chatsListDoc.list;
+    const chatList = Array.isArray(existingList)
+      ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
+      : existingList && typeof existingList === "object" ? existingList : {};
+    if (!Object.prototype.hasOwnProperty.call(chatList, chatId)) {
+      return res.status(404).json({ success: false, message: "Chat not found in user's list." });
+    }
+
+    const field = setting === "archive" ? "archieved" :
+      setting === "mute" ? "notification_muted" : "pinned";
+    const storedValue = setting === "mute" ? value : Boolean(value);
+    const settings = {
+      ...defaultChatSettings(),
+      ...(chatList[chatId] || {}),
+      [field]: storedValue,
+    };
+    const updatedDocument = {
+      ...withoutDocumentId(chatsListDoc),
+      list: { ...chatList, [chatId]: settings },
+    };
+    await firestoreManager.updateDocument(
+      "ChatsList",
+      formatPhoneNumberForAccountId(phoneNumber),
+      "/",
+      updatedDocument,
+    );
+
+    return res.status(200).json({ success: true, chatId, settings });
+  } catch (error) {
+    console.error("Error updating chat settings:", error.message);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
 router.post("/sync", async (req, res) => {
   try {
     const phoneNumber = normalizePhoneNumber(
@@ -95,6 +161,7 @@ router.post("/sync", async (req, res) => {
       return res.status(200).json({
         success: true,
         messages: [],
+        chatList: {},
         syncTime: Date.now(),
       });
     }
@@ -122,6 +189,7 @@ router.post("/sync", async (req, res) => {
     return res.status(200).json({
       success: true,
       messages,
+      chatList: chatsListDoc.list || {},
       syncTime: Date.now(),
     });
   } catch (error) {
@@ -297,11 +365,13 @@ function getChatIdFromChatListItem(chatListItem) {
 }
 
 function getChatIdsFromChatList(chatList) {
-  if (!Array.isArray(chatList)) {
-    return [];
+  if (Array.isArray(chatList)) {
+    return chatList.map(getChatIdFromChatListItem).filter(Boolean);
   }
-
-  return chatList.map(getChatIdFromChatListItem).filter(Boolean);
+  if (chatList && typeof chatList === "object") {
+    return Object.keys(chatList);
+  }
+  return [];
 }
 
 function getMessagesFromChatDocument(
@@ -351,27 +421,157 @@ async function getOtherUserProfileFromChatId(chatId, phoneNumber) {
 }
 
 async function getOtherUserProfilesFromChatList(chatList, phoneNumber) {
-  if (!Array.isArray(chatList)) {
-    return [];
-  }
+  const chatIds = getChatIdsFromChatList(chatList);
+  const chatContacts = chatIds.map((chatId) => ({
+    chatId,
+    phoneNumber: getOtherPhoneNumberFromChatId(chatId, phoneNumber),
+  }));
+  const contactPhoneNumbers = [
+    ...new Set(chatContacts.map((contact) => contact.phoneNumber).filter(Boolean)),
+  ];
+  const bulkReadStartedAt = process.hrtime.bigint();
+  const users = contactPhoneNumbers.length > 0
+    ? await firestoreManager.bulkReadDocuments(
+        "Users",
+        "/",
+        contactPhoneNumbers,
+        {},
+      )
+    : [];
+  console.log(
+    `[chats/list] bulk Users read completed in ${elapsedMilliseconds(bulkReadStartedAt)} ms` +
+      ` (requested=${contactPhoneNumbers.length}, found=${users.length})`,
+  );
+  const usersByPhoneNumber = new Map(
+    users.map((user) => {
+      const profilePhoneNumber = normalizePhoneNumberForChatId(
+        user && user.profileData && user.profileData.phoneNumber,
+      );
+      const documentPhoneNumber = normalizePhoneNumberForChatId(user && user._id);
+      return [profilePhoneNumber || documentPhoneNumber, user];
+    }),
+  );
 
-  const profilePromises = chatList.map(async (chatListItem) => {
-    const chatId = getChatIdFromChatListItem(chatListItem);
-    const userProfile = await getOtherUserProfileFromChatId(
-      chatId,
-      phoneNumber,
-    );
-
+  return chatContacts.map(({ chatId, phoneNumber: contactPhoneNumber }) => {
+    const user = usersByPhoneNumber.get(contactPhoneNumber);
+    const profileData = user && user.profileData ? user.profileData : {};
+    const chatSettings = getChatSettings(chatList, chatId);
     return {
       chatId,
-      ...(userProfile || {
-        phoneNumber: getOtherPhoneNumberFromChatId(chatId, phoneNumber),
-        profilePhotoUrl: null,
-      }),
+      phoneNumber:
+        normalizePhoneNumberForChatId(profileData.phoneNumber) ||
+        contactPhoneNumber,
+      profilePhotoUrl: profileData.profilePhotoUrl || null,
+      isOnline: (user && user.isOnline) || false,
+      lastSeen: (user && user.lastSeen) || Date.now(),
+      ...chatSettings,
     };
   });
+}
 
-  return Promise.all(profilePromises);
+function getChatSettings(chatList, chatId) {
+  const defaults = {
+    pinned: false,
+    notification_muted: "0",
+    archieved: false,
+    unread_count: 0,
+    last_message: null,
+  };
+  if (
+    !Array.isArray(chatList) &&
+    chatList &&
+    typeof chatList === "object" &&
+    chatList[chatId] &&
+    typeof chatList[chatId] === "object"
+  ) {
+    return { ...defaults, ...chatList[chatId] };
+  }
+  return defaults;
+}
+
+function normalizePageSize(value) {
+  const pageSize = Number(value || 20);
+  if (!Number.isInteger(pageSize) || pageSize < 1) return 20;
+  return Math.min(pageSize, 50);
+}
+
+function getChatSortEntry(chatId, settings) {
+  const normalizedSettings = getChatSettings({ [chatId]: settings }, chatId);
+  return {
+    chatId,
+    settings: normalizedSettings,
+    pinned: Boolean(normalizedSettings.pinned),
+    sentTime: Number(
+      normalizedSettings.last_message && normalizedSettings.last_message.sentTime,
+    ) || 0,
+  };
+}
+
+function compareChatSortEntries(first, second) {
+  if (first.pinned !== second.pinned) return first.pinned ? -1 : 1;
+  if (first.sentTime !== second.sentTime) return second.sentTime - first.sentTime;
+  return first.chatId.localeCompare(second.chatId);
+}
+
+function paginateChatList(chatList, pageSize, cursor) {
+  const chatIds = getChatIdsFromChatList(chatList);
+  const entries = chatIds
+    .map((chatId) => getChatSortEntry(
+      chatId,
+      !Array.isArray(chatList) && chatList ? chatList[chatId] : null,
+    ))
+    .sort(compareChatSortEntries);
+  const startIndex = cursor
+    ? entries.findIndex((entry) => compareChatSortEntries(entry, cursor) > 0)
+    : 0;
+  const safeStartIndex = startIndex < 0 ? entries.length : startIndex;
+  const pageEntries = entries.slice(safeStartIndex, safeStartIndex + pageSize);
+  const hasMore = safeStartIndex + pageEntries.length < entries.length;
+  const lastEntry = pageEntries[pageEntries.length - 1];
+  return {
+    chatList: Object.fromEntries(
+      pageEntries.map((entry) => [entry.chatId, entry.settings]),
+    ),
+    hasMore,
+    nextCursor: hasMore && lastEntry
+      ? encodeCursor({
+        pinned: lastEntry.pinned,
+        sentTime: lastEntry.sentTime,
+        chatId: lastEntry.chatId,
+      })
+      : null,
+  };
+}
+
+function encodeCursor(cursor) {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeCursor(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || value.length > 1_024) {
+    throw new Error("cursor is invalid.");
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.pinned !== "boolean" ||
+      !Number.isFinite(parsed.sentTime) ||
+      typeof parsed.chatId !== "string" ||
+      !parsed.chatId
+    ) {
+      throw new Error("invalid shape");
+    }
+    return parsed;
+  } catch (_error) {
+    throw new Error("cursor is invalid.");
+  }
+}
+
+function elapsedMilliseconds(startedAt) {
+  return (Number(process.hrtime.bigint() - startedAt) / 1_000_000).toFixed(2);
 }
 
 async function getUserProfileSummary(phoneNumber) {
@@ -425,6 +625,39 @@ function validateDiscoverContacts({ contacts }) {
     return "contacts must not be empty.";
   }
   return null;
+}
+
+function validateChatSetting({ phoneNumber, chatId, setting, value }) {
+  if (!chatId) return "chatId is required.";
+  if (!chatId.split("_").map(normalizePhoneNumberForChatId).includes(phoneNumber)) {
+    return "phoneNumber must be a participant in chatId.";
+  }
+  if (!["pin", "archive", "mute"].includes(setting)) {
+    return "setting must be pin, archive, or mute.";
+  }
+  if (!Number.isFinite(value)) return "value must be a number.";
+  if ((setting === "pin" || setting === "archive") && value !== 0 && value !== 1) {
+    return "pin and archive values must be 0 or 1.";
+  }
+  if (setting === "mute" && value !== -1 && value !== 0 && value <= Date.now()) {
+    return "mute value must be 0, -1, or a future timestamp.";
+  }
+  return null;
+}
+
+function defaultChatSettings() {
+  return {
+    pinned: false,
+    notification_muted: 0,
+    archieved: false,
+    unread_count: 0,
+  };
+}
+
+function withoutDocumentId(document) {
+  const copy = { ...(document || {}) };
+  delete copy._id;
+  return copy;
 }
 
 module.exports = router;
