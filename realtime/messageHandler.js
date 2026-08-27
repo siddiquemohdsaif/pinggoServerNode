@@ -117,7 +117,8 @@ async function handleSendMessage(ws, payload, sendJson) {
     await ensureChatReadyForMessage(chatId, senderId, receiverId);
     await saveMessage(chatId, message);
     await updateLastMessageForParticipants(message);
-    await incrementUnreadCount(receiverId, chatId).catch(() => null);
+    const receiverTotalUnread = await incrementUnreadCount(receiverId, chatId)
+      .catch(() => null);
     if (attachment) {
       const updatedAttachment = { ...attachment, status: "attached", messageId, attachedTime: sentTime };
       delete updatedAttachment._id;
@@ -145,6 +146,9 @@ async function handleSendMessage(ws, payload, sendJson) {
       sendJson(receiverSocket, {
         type: "new_message",
         message,
+        ...(receiverTotalUnread === null
+          ? {}
+          : { total_unread: receiverTotalUnread }),
       });
     } else {
       sendFcmWithoutFailingMessage({ receiverId, message });
@@ -230,7 +234,8 @@ async function handleSeenMessage(ws, payload, sendJson) {
   }, {});
 
   await updateMessages(chatId, updatedMessages);
-  await clearUnreadCount(ws.userId, chatId).catch(() => null);
+  const totalUnread = await clearUnreadCount(ws.userId, chatId)
+    .catch(() => null);
 
   sendJson(ws, {
     type: "message_seen_ack",
@@ -238,6 +243,7 @@ async function handleSeenMessage(ws, payload, sendJson) {
     messageIds,
     readTime,
     status: "seen",
+    ...(totalUnread === null ? {} : { total_unread: totalUnread }),
   });
 
   notifyMessageSenders({
@@ -577,6 +583,7 @@ async function saveMessage(chatId, message) {
 }
 
 async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType, text,
+  callerText, receiverText,
   durationSeconds, createdAt, ringingAt, connectedAt, endedAt, terminationReason }, sendJson) {
   if (!callId || !chatId || !callerId || !receiverId || !text) return null;
   const existingChat = await getChat(chatId);
@@ -592,6 +599,7 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
   const message = {
     id: String(sentTime), clientMessageId: null, callId, chatId,
     senderId: callerId, receiverId, text,
+    callerText: callerText || text, receiverText: receiverText || text,
     messageType: mediaType === "video" ? "video_call" : "voice_call",
     callDurationSeconds: durationSeconds, callCreatedAt: createdAt || null,
     callRingingAt: ringingAt || null, callConnectedAt: connectedAt || null,
@@ -602,10 +610,19 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
   await ensureChatReadyForMessage(chatId, callerId, receiverId);
   await saveMessage(chatId, message);
   await updateLastMessageForParticipants(message);
-  await incrementUnreadCount(receiverId, chatId).catch(() => null);
+  const receiverTotalUnread = await incrementUnreadCount(receiverId, chatId)
+    .catch(() => null);
   for (const userId of [callerId, receiverId]) {
     const socket = getUserSocket(userId);
-    if (socket) sendJson(socket, { type: "new_message", message });
+    const participantMessage = { ...message,
+      text: userId === callerId ? message.callerText : message.receiverText };
+    if (socket) sendJson(socket, {
+      type: "new_message",
+      message: participantMessage,
+      ...(userId === receiverId && receiverTotalUnread !== null
+        ? { total_unread: receiverTotalUnread }
+        : {}),
+    });
   }
   if (!getUserSocket(receiverId)) sendFcmWithoutFailingMessage({ receiverId, message });
   return message;
@@ -679,8 +696,12 @@ function defaultChatSettings() {
 
 async function updateLastMessageForParticipants(message) {
   await Promise.all([
-    updateLastMessage(message.senderId, message.chatId, message),
-    updateLastMessage(message.receiverId, message.chatId, message),
+    updateLastMessage(message.senderId, message.chatId, {
+      ...message, text: message.callerText || message.text,
+    }),
+    updateLastMessage(message.receiverId, message.chatId, {
+      ...message, text: message.receiverText || message.text,
+    }),
   ]);
 }
 
@@ -730,10 +751,13 @@ async function updateUnreadCount(userId, chatId, updater) {
   const settings = { ...defaultChatSettings(), ...(list[chatId] || {}) };
   const current = Number(settings.unread_count) || 0;
   settings.unread_count = Math.max(0, updater(current));
+  const updatedList = { ...list, [chatId]: settings };
   await firestoreManager.updateDocument("ChatsList", accountId, "/", {
     ...withoutDocumentId(existingDoc),
-    list: { ...list, [chatId]: settings },
+    list: updatedList,
   });
+  return Object.values(updatedList).reduce((total, chatSettings) =>
+    total + (Number(chatSettings && chatSettings.unread_count) > 0 ? 1 : 0), 0);
 }
 
 function withoutDocumentId(document) {

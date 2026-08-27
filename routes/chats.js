@@ -33,6 +33,7 @@ router.post("/list", async (req, res) => {
       return res.status(200).json({
         success: true,
         userProfiles,
+        total_unread: countUnreadChats(userDoc.list),
         nextCursor: page.nextCursor,
         hasMore: page.hasMore,
       });
@@ -115,6 +116,18 @@ router.post("/settings", async (req, res) => {
       : existingList && typeof existingList === "object" ? existingList : {};
     if (!Object.prototype.hasOwnProperty.call(chatList, chatId)) {
       return res.status(404).json({ success: false, message: "Chat not found in user's list." });
+    }
+
+    if (setting === "delete") {
+      const updatedList = { ...chatList };
+      delete updatedList[chatId];
+      await firestoreManager.updateDocument(
+        "ChatsList",
+        formatPhoneNumberForAccountId(phoneNumber),
+        "/",
+        { ...withoutDocumentId(chatsListDoc), list: updatedList },
+      );
+      return res.status(200).json({ success: true, chatId, deleted: true });
     }
 
     const field = setting === "archive" ? "archieved" :
@@ -489,6 +502,13 @@ function getChatSettings(chatList, chatId) {
   return defaults;
 }
 
+function countUnreadChats(chatList) {
+  return getChatIdsFromChatList(chatList).reduce((total, chatId) => {
+    const settings = getChatSettings(chatList, chatId);
+    return total + (Number(settings.unread_count) > 0 ? 1 : 0);
+  }, 0);
+}
+
 function normalizePageSize(value) {
   const pageSize = Number(value || 20);
   if (!Number.isInteger(pageSize) || pageSize < 1) return 20;
@@ -632,8 +652,8 @@ function validateChatSetting({ phoneNumber, chatId, setting, value }) {
   if (!chatId.split("_").map(normalizePhoneNumberForChatId).includes(phoneNumber)) {
     return "phoneNumber must be a participant in chatId.";
   }
-  if (!["pin", "archive", "mute"].includes(setting)) {
-    return "setting must be pin, archive, or mute.";
+  if (!["pin", "archive", "mute", "delete"].includes(setting)) {
+    return "setting must be pin, archive, mute, or delete.";
   }
   if (!Number.isFinite(value)) return "value must be a number.";
   if ((setting === "pin" || setting === "archive") && value !== 0 && value !== 1) {

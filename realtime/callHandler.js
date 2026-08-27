@@ -317,10 +317,13 @@ async function finalizeCallMessage(call, sendJson) {
   const label = call.mediaType === "video" ? "Video Call" : "Voice Call";
   const text = call.connectedAt
     ? `[${label}] ${formatDuration(durationSeconds)}` : `[${label}] missed`;
+  const callerText = call.connectedAt ? text : `[${label}] didn't connect`;
+  const receiverText = call.connectedAt ? text : `[${label}] missed`;
   try {
     await saveCallMessage({ callId: call.callId, chatId: call.chatId,
       callerId: call.callerId, receiverId: call.receiverId, mediaType: call.mediaType,
-      text, durationSeconds, createdAt: call.createdAt, ringingAt: call.ringingAt,
+      text, callerText, receiverText, durationSeconds,
+      createdAt: call.createdAt, ringingAt: call.ringingAt,
       connectedAt: call.connectedAt, endedAt: call.endedAt,
       terminationReason: call.terminationReason || "unknown" }, sendJson);
   } catch (error) {
