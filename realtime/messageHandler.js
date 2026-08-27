@@ -731,11 +731,11 @@ async function updateLastMessage(userId, chatId, message) {
 }
 
 async function incrementUnreadCount(userId, chatId) {
-  await updateUnreadCount(userId, chatId, (current) => current + 1);
+  return updateUnreadCount(userId, chatId, (current) => current + 1);
 }
 
 async function clearUnreadCount(userId, chatId) {
-  await updateUnreadCount(userId, chatId, () => 0);
+  return updateUnreadCount(userId, chatId, () => 0);
 }
 
 async function updateUnreadCount(userId, chatId, updater) {
