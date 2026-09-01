@@ -6,10 +6,15 @@ const {
   getOnlineUserCount,
 } = require("./connectionManager");
 const {
+  handleDeleteMessages,
   handleDeleteMessage,
+  handleDeleteOpponentMessages,
   handleDeleteOpponentMessage,
   handleDeliveredMessage,
   handleEditMessage,
+  handleForwardMessages,
+  handlePinMessages,
+  handleUnpinMessages,
   handleSeenMessage,
   handleSendMessage,
 } = require("./messageHandler");
@@ -114,8 +119,34 @@ async function handleMessage(ws, rawMessage) {
     return;
   }
 
+  if (message.type === "delete_messages") {
+    await handleDeleteMessages(ws, message, sendJson);
+    return;
+  }
+
   if (message.type === "delete_opponent_message") {
     await handleDeleteOpponentMessage(ws, message, sendJson);
+    return;
+  }
+
+
+  if (message.type === "delete_opponent_messages") {
+    await handleDeleteOpponentMessages(ws, message, sendJson);
+    return;
+  }
+
+  if (message.type === "pin_messages") {
+    await handlePinMessages(ws, message, sendJson);
+    return;
+  }
+
+  if (message.type === "unpin_messages") {
+    await handleUnpinMessages(ws, message, sendJson);
+    return;
+  }
+
+  if (message.type === "forward_messages") {
+    await handleForwardMessages(ws, message, sendJson);
     return;
   }
 

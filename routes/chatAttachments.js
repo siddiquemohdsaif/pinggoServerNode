@@ -13,7 +13,7 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: maxFileSizeMb * 1024 * 1024 },
 });
-const KINDS = new Set(["image", "video", "file"]);
+const KINDS = new Set(["image", "video", "audio", "file"]);
 const CHUNK_SIZE = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = maxFileSizeMb * 1024 * 1024;
 const CHUNK_SESSION_TTL_MS = Number(process.env.CHUNK_SESSION_TTL_HOURS || 24) * 60 * 60 * 1000;
@@ -208,13 +208,16 @@ router.post("/", upload.single("file"), async (req, res, next) => {
       return res.status(403).json({ success: false, message: "You are not a participant in this chat." });
     }
     if (!KINDS.has(kind)) {
-      return res.status(400).json({ success: false, message: "kind must be image, video, or file." });
+      return res.status(400).json({ success: false, message: "kind must be image, video, audio, or file." });
     }
     if (kind === "image" && !req.file.mimetype.startsWith("image/")) {
       return res.status(400).json({ success: false, message: "Selected file is not an image." });
     }
     if (kind === "video" && !req.file.mimetype.startsWith("video/")) {
       return res.status(400).json({ success: false, message: "Selected file is not a video." });
+    }
+    if (kind === "audio" && !req.file.mimetype.startsWith("audio/")) {
+      return res.status(400).json({ success: false, message: "Selected file is not audio." });
     }
     if (!matchesDeclaredContent(req.file.buffer, kind, req.file.mimetype)) {
       return res.status(400).json({ success: false, message: "Attachment content does not match its declared type." });
@@ -300,6 +303,14 @@ async function inspectFile(filePath) {
 function matchesDeclaredContent(buffer, kind, mimeType) {
   if (kind === "file") return true;
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  if (kind === "audio") {
+    if (!mimeType.startsWith("audio/")) return false;
+    if (mimeType === "audio/mp4" || mimeType === "audio/m4a"
+        || mimeType === "audio/x-m4a") {
+      return buffer.subarray(4, 8).toString("ascii") === "ftyp";
+    }
+    return true;
+  }
   if (kind === "video") {
     return mimeType === "video/mp4"
       ? buffer.subarray(4, 8).toString("ascii") === "ftyp"
@@ -318,9 +329,10 @@ function matchesDeclaredContent(buffer, kind, mimeType) {
 
 function validateChunkInit({ chatId, uploaderId, kind, mimeType, totalSize, totalChunks }) {
   if (!chatId || !isChatParticipant(chatId, uploaderId)) return statusError(403, "You are not a participant in this chat.");
-  if (!KINDS.has(kind)) return statusError(400, "kind must be image, video, or file.");
+  if (!KINDS.has(kind)) return statusError(400, "kind must be image, video, audio, or file.");
   if (kind === "image" && !mimeType.startsWith("image/")) return statusError(400, "Selected file is not an image.");
   if (kind === "video" && !mimeType.startsWith("video/")) return statusError(400, "Selected file is not a video.");
+  if (kind === "audio" && !mimeType.startsWith("audio/")) return statusError(400, "Selected file is not audio.");
   if (!Number.isInteger(totalSize) || totalSize <= 0 || totalSize > MAX_FILE_BYTES) return statusError(413, `File must be ${maxFileSizeMb} MB or smaller.`);
   if (!Number.isInteger(totalChunks) || totalChunks !== Math.ceil(totalSize / CHUNK_SIZE)) return statusError(400, "totalChunks does not match totalSize.");
   return null;

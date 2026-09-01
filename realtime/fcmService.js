@@ -38,7 +38,8 @@ async function sendOfflineMessageNotification({ receiverId, message }) {
       },
       notification: {
         title: "New message",
-        body: message.text,
+        body: message.messageType === "audio" || message.messageType === "voice"
+          ? "Voice message" : message.text,
       },
     },
     {

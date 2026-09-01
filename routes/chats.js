@@ -10,6 +10,7 @@ router.post("/list", async (req, res) => {
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
     const pageSize = normalizePageSize(req.body.pageSize);
+    const messageCacheSize = normalizeMessageCacheSize(req.body.messageCacheSize);
     const cursor = decodeCursor(req.body.cursor);
 
     const validationError = validatePhoneNumber({ phoneNumber });
@@ -25,14 +26,15 @@ router.post("/list", async (req, res) => {
 
     if (userDoc) {
       const page = paginateChatList(userDoc.list, pageSize, cursor);
-      const userProfiles = await getOtherUserProfilesFromChatList(
-        page.chatList,
-        phoneNumber,
-      );
+      const [userProfiles, messageCache] = await Promise.all([
+        getOtherUserProfilesFromChatList(page.chatList, phoneNumber),
+        getRecentMessageCache(page.chatList, messageCacheSize),
+      ]);
 
       return res.status(200).json({
         success: true,
         userProfiles,
+        messageCache,
         total_unread: countUnreadChats(userDoc.list),
         nextCursor: page.nextCursor,
         hasMore: page.hasMore,
@@ -63,11 +65,20 @@ router.post("/getChat", async (req, res) => {
     }
 
     const chatId = req.body.chatId;
+    const paginated = req.body.pageSize !== undefined || req.body.cursor !== undefined;
+    const pageSize = normalizePageSize(req.body.pageSize);
+    const cursor = paginated ? decodeMessageCursor(req.body.cursor) : null;
 
     if (!chatId) {
       return res
         .status(400)
         .json({ success: false, message: "Chat Id missing" });
+    }
+    if (!chatId.split("_").map(normalizePhoneNumberForChatId).includes(phoneNumber)) {
+      return res.status(403).json({
+        success: false,
+        message: "phoneNumber must be a participant in chatId.",
+      });
     }
 
     const chatDoc = await getSingleChatByChatId(chatId);
@@ -78,11 +89,26 @@ router.post("/getChat", async (req, res) => {
         phoneNumber,
       );
 
-      return res.status(200).json({
-        success: true,
-        chat: chatDoc,
-        userProfile,
-      });
+      if (paginated) {
+        const page = paginateChatMessages(chatDoc, chatId, pageSize, cursor);
+        const pinnedMessages = cursor ? [] : getPinnedChatMessages(chatDoc, chatId);
+        return res.status(200).json({
+          success: true,
+          pinnedMessages,
+          messages: page.messages,
+          replyMessages: getReplyMessagesForPage(
+            chatDoc,
+            chatId,
+            [...page.messages, ...pinnedMessages],
+          ),
+          nextCursor: page.nextCursor,
+          hasMore: page.hasMore,
+          userProfile,
+        });
+      }
+
+      // Keep the old response available to clients that do not request pagination.
+      return res.status(200).json({ success: true, chat: chatDoc, userProfile });
     }
 
     return res.status(404).json({ success: false, message: "No user found." });
@@ -152,6 +178,73 @@ router.post("/settings", async (req, res) => {
     return res.status(200).json({ success: true, chatId, settings });
   } catch (error) {
     console.error("Error updating chat settings:", error.message);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+router.post("/settings/bulk", async (req, res) => {
+  try {
+    const phoneNumber = normalizePhoneNumber(
+      req.body.phoneNumber || req.body.phone_number || req.body.phone,
+    );
+    const chatIds = Array.isArray(req.body.chatIds)
+      ? [...new Set(req.body.chatIds.map(normalizeString))]
+      : null;
+    const setting = normalizeString(req.body.setting);
+    const value = Number(req.body.value);
+
+    const validationError = validatePhoneNumber({ phoneNumber }) ||
+      validateBulkChatSetting({ phoneNumber, chatIds, setting, value });
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+
+    const accountId = formatPhoneNumberForAccountId(phoneNumber);
+    const chatsListDoc = await getChatsListByPhoneNumber(accountId);
+    const existingList = chatsListDoc && chatsListDoc.list;
+    const chatList = Array.isArray(existingList)
+      ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
+      : existingList && typeof existingList === "object" ? existingList : {};
+    const missingChatIds = chatIds.filter(
+      (chatId) => !Object.prototype.hasOwnProperty.call(chatList, chatId),
+    );
+    if (missingChatIds.length > 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Some chats were not found in user's list.",
+        missingChatIds,
+      });
+    }
+
+    const updatedList = { ...chatList };
+    if (setting === "delete") {
+      for (const chatId of chatIds) delete updatedList[chatId];
+    } else {
+      const field = setting === "archive" ? "archieved" :
+        setting === "mute" ? "notification_muted" : "pinned";
+      const storedValue = setting === "mute" ? value : Boolean(value);
+      for (const chatId of chatIds) {
+        updatedList[chatId] = {
+          ...defaultChatSettings(),
+          ...(chatList[chatId] || {}),
+          [field]: storedValue,
+        };
+      }
+    }
+
+    await firestoreManager.updateDocument(
+      "ChatsList",
+      accountId,
+      "/",
+      { ...withoutDocumentId(chatsListDoc), list: updatedList },
+    );
+    return res.status(200).json({
+      success: true,
+      chatIds,
+      deleted: setting === "delete",
+    });
+  } catch (error) {
+    console.error("Error updating bulk chat settings:", error.message);
     return res.status(400).json({ success: false, message: error.message });
   }
 });
@@ -407,6 +500,96 @@ function getMessagesFromChatDocument(
     }));
 }
 
+function getPageableMessagesFromChatDocument(chat, chatId) {
+  if (!chat || typeof chat !== "object") return [];
+  return Object.entries(chat)
+    .filter(([, value]) =>
+      value &&
+      typeof value === "object" &&
+      Object.prototype.hasOwnProperty.call(value, "text") &&
+      Number.isFinite(Number(value.sentTime)),
+    )
+    .map(([documentKey, message]) => ({
+      ...message,
+      id: normalizeString(message.id) || documentKey,
+      chatId: message.chatId || chatId,
+      sentTime: Number(message.sentTime),
+    }));
+}
+
+function compareMessageSortEntries(first, second) {
+  if (first.sentTime !== second.sentTime) return second.sentTime - first.sentTime;
+  return second.id.localeCompare(first.id);
+}
+
+function paginateChatMessages(chat, chatId, pageSize, cursor) {
+  const entries = getPageableMessagesFromChatDocument(chat, chatId)
+    .sort(compareMessageSortEntries);
+  const startIndex = cursor
+    ? entries.findIndex((entry) => compareMessageSortEntries(entry, cursor) > 0)
+    : 0;
+  const safeStartIndex = startIndex < 0 ? entries.length : startIndex;
+  const pageEntries = entries.slice(safeStartIndex, safeStartIndex + pageSize);
+  const hasMore = safeStartIndex + pageEntries.length < entries.length;
+  const lastEntry = pageEntries[pageEntries.length - 1];
+  return {
+    messages: [...pageEntries].reverse(),
+    hasMore,
+    nextCursor: hasMore && lastEntry
+      ? encodeCursor({ sentTime: lastEntry.sentTime, messageId: lastEntry.id })
+      : null,
+  };
+}
+
+function getReplyMessagesForPage(chat, chatId, pageMessages) {
+  if (!Array.isArray(pageMessages) || pageMessages.length === 0) return [];
+  const pageIds = new Set(pageMessages
+    .map((message) => normalizeString(message && message.id))
+    .filter(Boolean));
+  const replyIds = new Set(pageMessages
+    .map((message) => normalizeString(message && message.repliedMessageId))
+    .filter((messageId) => messageId && !pageIds.has(messageId)));
+  if (replyIds.size === 0) return [];
+  return getPageableMessagesFromChatDocument(chat, chatId)
+    .filter((message) => replyIds.has(message.id));
+}
+
+function getPinnedChatMessages(chat, chatId) {
+  return getPageableMessagesFromChatDocument(chat, chatId)
+    .filter((message) => (Array.isArray(message.pinned) && message.pinned.length > 0)
+      || message.pinned === true || message.pinned === "true")
+    .sort((first, second) => {
+      const firstPinnedAt = Number(first.pinned_at || first.pinnedAt || first.sentTime || 0);
+      const secondPinnedAt = Number(second.pinned_at || second.pinnedAt || second.sentTime || 0);
+      if (firstPinnedAt !== secondPinnedAt) return secondPinnedAt - firstPinnedAt;
+      return compareMessageSortEntries(first, second);
+    });
+}
+
+async function getRecentMessageCache(chatList, cacheSize) {
+  if (cacheSize <= 0) return {};
+  const chatIds = getChatIdsFromChatList(chatList);
+  if (chatIds.length === 0) return {};
+  try {
+    const chatsById = await firestoreManager.bulkReadDocuments(
+      "Chats",
+      "/",
+      chatIds,
+      {},
+      true,
+    );
+    return Object.fromEntries(
+      chatIds.map((chatId) => [
+        chatId,
+        paginateChatMessages(chatsById[chatId], chatId, cacheSize, null).messages,
+      ]),
+    );
+  } catch (error) {
+    console.error("Unable to prefetch recent chat messages:", error.message);
+    return {};
+  }
+}
+
 function isChatMessageForSync(value, normalizedAccountId, lastSyncTime) {
   if (!value || typeof value !== "object") {
     return false;
@@ -515,6 +698,13 @@ function normalizePageSize(value) {
   return Math.min(pageSize, 50);
 }
 
+function normalizeMessageCacheSize(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const cacheSize = Number(value);
+  if (!Number.isInteger(cacheSize) || cacheSize < 1) return 0;
+  return Math.min(cacheSize, 50);
+}
+
 function getChatSortEntry(chatId, settings) {
   const normalizedSettings = getChatSettings({ [chatId]: settings }, chatId);
   return {
@@ -585,6 +775,28 @@ function decodeCursor(value) {
       throw new Error("invalid shape");
     }
     return parsed;
+  } catch (_error) {
+    throw new Error("cursor is invalid.");
+  }
+}
+
+function decodeMessageCursor(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || value.length > 1_024) {
+    throw new Error("cursor is invalid.");
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      !Number.isFinite(parsed.sentTime) ||
+      typeof parsed.messageId !== "string" ||
+      !parsed.messageId
+    ) {
+      throw new Error("invalid shape");
+    }
+    return { sentTime: parsed.sentTime, id: parsed.messageId };
   } catch (_error) {
     throw new Error("cursor is invalid.");
   }
@@ -661,6 +873,22 @@ function validateChatSetting({ phoneNumber, chatId, setting, value }) {
   }
   if (setting === "mute" && value !== -1 && value !== 0 && value <= Date.now()) {
     return "mute value must be 0, -1, or a future timestamp.";
+  }
+  return null;
+}
+
+function validateBulkChatSetting({ phoneNumber, chatIds, setting, value }) {
+  if (!Array.isArray(chatIds) || chatIds.length === 0) {
+    return "chatIds must be a non-empty array.";
+  }
+  for (const chatId of chatIds) {
+    const validationError = validateChatSetting({
+      phoneNumber,
+      chatId,
+      setting,
+      value,
+    });
+    if (validationError) return validationError;
   }
   return null;
 }

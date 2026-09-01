@@ -70,7 +70,7 @@ async function handleSendMessage(ws, payload, sendJson) {
   }
 
   let attachment = null;
-  if (["image", "video", "file"].includes(messageType)) {
+  if (["image", "video", "audio", "file"].includes(messageType)) {
     try {
       attachment = await firestoreManager.readDocument("ChatAttachments", attachmentId, "/");
     } catch (_error) {
@@ -234,6 +234,10 @@ async function handleSeenMessage(ws, payload, sendJson) {
   }, {});
 
   await updateMessages(chatId, updatedMessages);
+  const latestSeenMessage = latestMessage(Object.values(updatedMessages));
+  if (latestSeenMessage) {
+    await updateLastMessageForParticipants(latestSeenMessage);
+  }
   const totalUnread = await clearUnreadCount(ws.userId, chatId)
     .catch(() => null);
 
@@ -400,9 +404,27 @@ async function handleDeleteMessage(ws, payload, sendJson) {
     return;
   }
 
+  if (isDeletedMessage(existingMessage)) {
+    const invisible = addInvisibleNumber(existingMessage.invisible, ws.userId);
+    const alreadyInvisible = invisible.length === invisibleNumbers(existingMessage.invisible).length;
+    if (!alreadyInvisible) {
+      await updateMessages(chatId, {
+        [messageId]: { ...existingMessage, invisible },
+      });
+    }
+    sendJson(ws, {
+      type: "delete_message_ack", chatId, messageId,
+      deletedTime: existingMessage.deletedTime || null,
+      message: { ...existingMessage, invisible }, hidden: true,
+      skipped: alreadyInvisible,
+    });
+    return;
+  }
+
   const deletedTime = Date.now();
   const deletedMessage = {
     ...existingMessage,
+    deletedText: existingMessage.text,
     text: "This Message was deleted",
     deletedTime,
   };
@@ -471,9 +493,18 @@ async function handleDeleteOpponentMessage(ws, payload, sendJson) {
     return;
   }
 
+  const invisible = addInvisibleNumber(existingMessage.invisible, ws.userId);
+  const alreadyInvisible = invisible.length === invisibleNumbers(existingMessage.invisible).length;
+  if (alreadyInvisible) {
+    sendJson(ws, {
+      type: "delete_opponent_message_ack", chatId, messageId, skipped: true,
+    });
+    return;
+  }
+
   const hiddenMessage = {
     ...existingMessage,
-    visible: "gone",
+    invisible,
   };
 
   await updateMessages(chatId, {
@@ -485,6 +516,264 @@ async function handleDeleteOpponentMessage(ws, payload, sendJson) {
     chatId,
     messageId,
   });
+}
+
+async function handleDeleteMessages(ws, payload, sendJson) {
+  const chatId = normalizeString(payload.chatId);
+  const messageIds = normalizedMessageIds(payload.messageIds);
+  const senderId = normalizeAccountId(payload.senderId || ws.userId);
+  const validationError = validateMessageIdsRequest({ chatId, messageIds });
+  if (validationError || senderId !== ws.userId) {
+    sendJson(ws, {
+      type: "delete_messages_failed", chatId: chatId || null,
+      message: validationError || "senderId must match authenticated user.",
+    });
+    return;
+  }
+  const chat = await getChat(chatId);
+  const invalidId = messageIds.find((id) => !chat || !chat[id]
+    || normalizeAccountId(chat[id].senderId) !== ws.userId);
+  if (invalidId) {
+    sendJson(ws, { type: "delete_messages_failed", chatId,
+      message: `Message missing or not owned by sender: ${invalidId}` });
+    return;
+  }
+  const pendingMessageIds = messageIds.filter((id) => !isDeletedMessage(chat[id]));
+  const hiddenMessageIds = messageIds.filter((id) => isDeletedMessage(chat[id])
+    && !includesInvisibleNumber(chat[id].invisible, ws.userId));
+  const skippedMessageIds = messageIds.filter((id) => isDeletedMessage(chat[id])
+    && includesInvisibleNumber(chat[id].invisible, ws.userId));
+  const deletedTime = Date.now();
+  const updates = {};
+  pendingMessageIds.forEach((id) => {
+    updates[id] = { ...chat[id], deletedText: chat[id].text,
+      text: "This Message was deleted", deletedTime };
+  });
+  hiddenMessageIds.forEach((id) => {
+    updates[id] = { ...chat[id],
+      invisible: addInvisibleNumber(chat[id].invisible, ws.userId) };
+  });
+  if (Object.keys(updates).length > 0) await updateMessages(chatId, updates);
+  sendJson(ws, { type: "delete_messages_ack", chatId, messageIds,
+    updatedMessageIds: [...pendingMessageIds, ...hiddenMessageIds],
+    hiddenMessageIds: [...hiddenMessageIds, ...skippedMessageIds],
+    skippedMessageIds, deletedTime });
+  pendingMessageIds.forEach((messageId) => notifyMessageReceiver({
+    receiverId: updates[messageId].receiverId,
+    payload: { type: "message_deleted", chatId, messageId, deletedTime,
+      message: updates[messageId] },
+    sendJson,
+  }));
+}
+
+async function handleDeleteOpponentMessages(ws, payload, sendJson) {
+  const chatId = normalizeString(payload.chatId);
+  const messageIds = normalizedMessageIds(payload.messageIds);
+  const validationError = validateMessageIdsRequest({ chatId, messageIds });
+  if (validationError) {
+    sendJson(ws, { type: "delete_opponent_messages_failed", chatId: chatId || null,
+      message: validationError });
+    return;
+  }
+  const chat = await getChat(chatId);
+  const invalidId = messageIds.find((id) => !chat || !chat[id]
+    || !isMessageParticipant(chat[id], ws.userId));
+  if (invalidId) {
+    sendJson(ws, { type: "delete_opponent_messages_failed", chatId,
+      message: `Message missing or user is not a participant: ${invalidId}` });
+    return;
+  }
+  const pendingMessageIds = messageIds.filter((id) =>
+    !includesInvisibleNumber(chat[id].invisible, ws.userId));
+  const skippedMessageIds = messageIds.filter((id) =>
+    includesInvisibleNumber(chat[id].invisible, ws.userId));
+  if (pendingMessageIds.length > 0) {
+    const updates = {};
+    pendingMessageIds.forEach((id) => {
+      updates[id] = { ...chat[id],
+        invisible: addInvisibleNumber(chat[id].invisible, ws.userId) };
+    });
+    await updateMessages(chatId, updates);
+  }
+  sendJson(ws, { type: "delete_opponent_messages_ack", chatId, messageIds,
+    updatedMessageIds: pendingMessageIds, skippedMessageIds });
+}
+
+async function handlePinMessages(ws, payload, sendJson) {
+  const chatId = normalizeString(payload.chatId);
+  const messageIds = normalizedMessageIds(payload.messageIds);
+  const validationError = validateMessageIdsRequest({ chatId, messageIds });
+  if (validationError) {
+    sendJson(ws, { type: "pin_messages_failed", chatId: chatId || null,
+      message: validationError });
+    return;
+  }
+  const chat = await getChat(chatId);
+  const invalidId = messageIds.find((id) => !chat || !chat[id]
+    || !isMessageParticipant(chat[id], ws.userId));
+  if (invalidId) {
+    sendJson(ws, { type: "pin_messages_failed", chatId,
+      message: `Message missing or user is not a participant: ${invalidId}` });
+    return;
+  }
+  const pendingMessageIds = messageIds.filter((id) =>
+    !pinnedMessageUsers(chat[id]).includes(ws.userId));
+  const skippedMessageIds = messageIds.filter((id) =>
+    pinnedMessageUsers(chat[id]).includes(ws.userId));
+  const pinnedAt = Date.now();
+  const updates = {};
+  const pinStates = {};
+  pendingMessageIds.forEach((id) => {
+    const pinned = [...new Set([...pinnedMessageUsers(chat[id]), ws.userId])];
+    updates[id] = { ...chat[id], pinned, pinned_at: pinnedAt };
+    pinStates[id] = { pinned, pinned_at: pinnedAt };
+  });
+  if (pendingMessageIds.length > 0) await updateMessages(chatId, updates);
+  const result = { chatId, messageIds: pendingMessageIds,
+    requestedMessageIds: messageIds, updatedMessageIds: pendingMessageIds,
+    skippedMessageIds, pinned_by: ws.userId, pin_states: pinStates,
+    pinned_at: pendingMessageIds.length > 0 ? pinnedAt : null };
+  sendJson(ws, { type: "pin_messages_ack", ...result });
+  const participants = new Set();
+  pendingMessageIds.forEach((id) => {
+    participants.add(normalizeAccountId(chat[id].senderId));
+    participants.add(normalizeAccountId(chat[id].receiverId));
+  });
+  participants.delete(ws.userId);
+  participants.forEach((userId) => {
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, { type: "messages_pinned", ...result });
+  });
+}
+
+async function handleUnpinMessages(ws, payload, sendJson) {
+  const chatId = normalizeString(payload.chatId);
+  const messageIds = normalizedMessageIds(payload.messageIds);
+  const validationError = validateMessageIdsRequest({ chatId, messageIds });
+  if (validationError) {
+    sendJson(ws, { type: "unpin_messages_failed", chatId: chatId || null,
+      message: validationError });
+    return;
+  }
+  const chat = await getChat(chatId);
+  const invalidId = messageIds.find((id) => !chat || !chat[id]
+    || !isMessageParticipant(chat[id], ws.userId));
+  if (invalidId) {
+    sendJson(ws, { type: "unpin_messages_failed", chatId,
+      message: `Message missing or user is not a participant: ${invalidId}` });
+    return;
+  }
+  const pendingMessageIds = messageIds.filter((id) =>
+    pinnedMessageUsers(chat[id]).includes(ws.userId)
+      || (isPinnedMessage(chat[id]) && pinnedMessageUsers(chat[id]).length === 0));
+  const skippedMessageIds = messageIds.filter((id) =>
+    !pendingMessageIds.includes(id));
+  const updates = {};
+  const pinStates = {};
+  pendingMessageIds.forEach((id) => {
+    const pinned = pinnedMessageUsers(chat[id]).filter((userId) => userId !== ws.userId);
+    const pinnedAt = pinned.length > 0 ? chat[id].pinned_at || null : null;
+    updates[id] = { ...chat[id], pinned, pinned_at: pinnedAt };
+    pinStates[id] = { pinned, pinned_at: pinnedAt };
+  });
+  if (pendingMessageIds.length > 0) await updateMessages(chatId, updates);
+  const result = { chatId, messageIds: pendingMessageIds,
+    requestedMessageIds: messageIds, updatedMessageIds: pendingMessageIds,
+    skippedMessageIds, pinned_by: ws.userId, pin_states: pinStates, pinned_at: null };
+  sendJson(ws, { type: "unpin_messages_ack", ...result });
+  const participants = new Set();
+  pendingMessageIds.forEach((id) => {
+    participants.add(normalizeAccountId(chat[id].senderId));
+    participants.add(normalizeAccountId(chat[id].receiverId));
+  });
+  participants.delete(ws.userId);
+  participants.forEach((userId) => {
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, { type: "messages_unpinned", ...result });
+  });
+}
+
+async function handleForwardMessages(ws, payload, sendJson) {
+  const sourceChatId = normalizeString(payload.sourceChatId);
+  const destinationChatId = normalizeString(payload.destinationChatId);
+  const messageIds = normalizedMessageIds(payload.messageIds);
+  const senderId = normalizeAccountId(payload.senderId || ws.userId);
+  const receiverId = normalizeAccountId(payload.receiverId);
+  const operationId = normalizeString(payload.operationId);
+  const validationError = validateMessageIdsRequest({ chatId: sourceChatId, messageIds });
+  if (validationError || !operationId || senderId !== ws.userId || !receiverId
+      || !validChatParticipants(destinationChatId, senderId, receiverId)) {
+    sendJson(ws, { type: "forward_messages_failed", sourceChatId: sourceChatId || null,
+      destinationChatId: destinationChatId || null,
+      message: validationError || (!operationId
+        ? "operationId is required."
+        : senderId !== ws.userId
+        ? "senderId must match authenticated user."
+        : "Forward destination is invalid.") });
+    return;
+  }
+  const sourceChat = await getChat(sourceChatId);
+  const invalidId = messageIds.find((id) => !sourceChat || !sourceChat[id]
+    || !isMessageParticipant(sourceChat[id], ws.userId));
+  if (invalidId) {
+    sendJson(ws, { type: "forward_messages_failed", sourceChatId, destinationChatId,
+      message: `Message missing or user is not a participant: ${invalidId}` });
+    return;
+  }
+  const destinationBeforeForward = await getChat(destinationChatId);
+  const existingBySourceId = new Map(
+    Object.values(destinationBeforeForward || {})
+      .filter((message) => message && message.forward_operation_id === operationId
+        && normalizeAccountId(message.senderId) === senderId)
+      .map((message) => [normalizeString(message.forwarded_message_id), message]),
+  );
+  await ensureChatReadyForMessage(destinationChatId, senderId, receiverId);
+  const skippedMessageIds = messageIds.filter((sourceId) =>
+    existingBySourceId.has(sourceId) || isDeletedMessage(sourceChat[sourceId]));
+  const pendingMessageIds = messageIds.filter((sourceId) =>
+    !existingBySourceId.has(sourceId) && !isDeletedMessage(sourceChat[sourceId]));
+  const newMessages = pendingMessageIds.map((sourceId) => {
+    const source = sourceChat[sourceId];
+    const sentTime = nextMessageTimestamp();
+    const forwarded = {
+      id: String(sentTime), clientMessageId: null, chatId: destinationChatId,
+      senderId, receiverId, text: normalizeString(source.text),
+      messageType: normalizeString(source.messageType || "text").toLowerCase(),
+      sentTime, deliveredTime: null, readTime: null, status: "sent",
+      forwarded_from: normalizeAccountId(source.forwarded_from || source.senderId),
+      forwarded_message_id: sourceId,
+      forward_operation_id: operationId,
+    };
+    if (source.attachment) forwarded.attachment = { ...source.attachment };
+    if (source.location) forwarded.location = { ...source.location };
+    return forwarded;
+  });
+  if (newMessages.length > 0) {
+    await updateMessages(destinationChatId,
+      Object.fromEntries(newMessages.map((message) => [message.id, message])));
+  }
+  for (const message of newMessages) await updateLastMessageForParticipants(message);
+  let receiverTotalUnread = null;
+  for (const _message of newMessages) {
+    receiverTotalUnread = await incrementUnreadCount(receiverId, destinationChatId)
+      .catch(() => receiverTotalUnread);
+  }
+  const messages = messageIds
+    .map((sourceId) => existingBySourceId.get(sourceId)
+      || newMessages.find((message) => message.forwarded_message_id === sourceId))
+    .filter(Boolean);
+  sendJson(ws, { type: "forward_messages_ack", sourceChatId, destinationChatId,
+    operationId, messages, forwardedMessageIds: pendingMessageIds, skippedMessageIds });
+  const receiverSocket = getUserSocket(receiverId);
+  for (let index = 0; index < newMessages.length; index += 1) {
+    const message = newMessages[index];
+    if (receiverSocket) sendJson(receiverSocket, {
+      type: "new_message", message,
+      ...(index === newMessages.length - 1 && receiverTotalUnread !== null
+        ? { total_unread: receiverTotalUnread } : {}),
+    });
+    else sendFcmWithoutFailingMessage({ receiverId, message });
+  }
 }
 
 async function handleDeliveredMessage(ws, payload, sendJson) {
@@ -536,8 +825,12 @@ async function handleDeliveredMessage(ws, payload, sendJson) {
     return;
   }
 
+  const pendingMessageIds = messageIds.filter((messageId) => {
+    const message = chat[messageId];
+    return !message.deliveredTime && !message.readTime;
+  });
   const deliveredTime = Date.now();
-  const updatedMessages = messageIds.reduce((updates, messageId) => {
+  const updatedMessages = pendingMessageIds.reduce((updates, messageId) => {
     updates[messageId] = {
       ...chat[messageId],
       deliveredTime,
@@ -546,7 +839,18 @@ async function handleDeliveredMessage(ws, payload, sendJson) {
     return updates;
   }, {});
 
-  await updateMessages(chatId, updatedMessages);
+  if (pendingMessageIds.length) {
+    await updateMessages(chatId, updatedMessages);
+  }
+
+  // ChatsList stores a denormalized last_message. Synchronize it on every request,
+  // including duplicate delivery acknowledgements, so stale list data is repaired.
+  const receiptMessages = messageIds.map((messageId) =>
+    updatedMessages[messageId] || chat[messageId]).filter(Boolean);
+  const latestDeliveredMessage = latestMessage(receiptMessages);
+  if (latestDeliveredMessage) {
+    await updateLastMessageForParticipants(latestDeliveredMessage);
+  }
 
   sendJson(ws, {
     type: "message_delivered_ack",
@@ -556,18 +860,20 @@ async function handleDeliveredMessage(ws, payload, sendJson) {
     status: "delivered",
   });
 
-  notifyMessageSenders({
-    chat,
-    messageIds,
-    payload: {
-      type: "message_delivered",
-      chatId,
-      messageIds,
-      deliveredTime,
-      status: "delivered",
-    },
-    sendJson,
-  });
+  if (pendingMessageIds.length) {
+    notifyMessageSenders({
+      chat,
+      messageIds: pendingMessageIds,
+      payload: {
+        type: "message_delivered",
+        chatId,
+        messageIds: pendingMessageIds,
+        deliveredTime,
+        status: "delivered",
+      },
+      sendJson,
+    });
+  }
 }
 
 async function saveMessage(chatId, message) {
@@ -703,6 +1009,15 @@ async function updateLastMessageForParticipants(message) {
       ...message, text: message.receiverText || message.text,
     }),
   ]);
+}
+
+function latestMessage(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  return messages.reduce((latest, message) => {
+    if (!message) return latest;
+    if (!latest) return message;
+    return Number(message.sentTime) >= Number(latest.sentTime) ? message : latest;
+  }, null);
 }
 
 async function updateLastMessage(userId, chatId, message) {
@@ -876,13 +1191,13 @@ function validateSendMessage({ chatId, senderId, receiverId, text, messageType, 
   if (!receiverId) {
     return "receiverId is required.";
   }
-  if (!["text", "image", "video", "file", "location"].includes(messageType)) {
-    return "messageType must be text, image, video, file, or location.";
+  if (!["text", "image", "video", "audio", "file", "location"].includes(messageType)) {
+    return "messageType must be text, image, video, audio, file, or location.";
   }
   if (messageType === "text" && !text) {
     return "text is required.";
   }
-  if (["image", "video", "file"].includes(messageType) && !attachmentId) {
+  if (["image", "video", "audio", "file"].includes(messageType) && !attachmentId) {
     return "attachmentId is required.";
   }
   if (messageType === "location" && !location) {
@@ -915,6 +1230,56 @@ function validateMessageIdsRequest({ chatId, messageIds }) {
   return null;
 }
 
+function normalizedMessageIds(values) {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values.map(normalizeString).filter(Boolean))];
+}
+
+function isMessageParticipant(message, userId) {
+  const accountId = normalizeAccountId(userId);
+  return Boolean(message) && [message.senderId, message.receiverId]
+    .map(normalizeAccountId).includes(accountId);
+}
+
+function isDeletedMessage(message) {
+  return Boolean(message) && (message.deletedText != null
+    || message.text === "This Message was deleted"
+    || message.deletedTime != null);
+}
+
+function isPinnedMessage(message) {
+  return Boolean(message) && (pinnedMessageUsers(message).length > 0
+    || message.pinned === true || message.pinned === "true");
+}
+
+function pinnedMessageUsers(message) {
+  if (!message || !Array.isArray(message.pinned)) return [];
+  return [...new Set(message.pinned.map(normalizeAccountId).filter(Boolean))];
+}
+
+function invisibleNumbers(values) {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values.map(normalizeAccountId).filter(Boolean))];
+}
+
+function includesInvisibleNumber(values, userId) {
+  return invisibleNumbers(values).includes(normalizeAccountId(userId));
+}
+
+function addInvisibleNumber(values, userId) {
+  const numbers = invisibleNumbers(values);
+  const accountId = normalizeAccountId(userId);
+  if (accountId && !numbers.includes(accountId)) numbers.push(accountId);
+  return numbers;
+}
+
+function validChatParticipants(chatId, firstUserId, secondUserId) {
+  if (!chatId) return false;
+  const participants = chatId.split("_").map(normalizeAccountId);
+  return participants.includes(normalizeAccountId(firstUserId))
+    && participants.includes(normalizeAccountId(secondUserId));
+}
+
 function normalizeAccountId(value) {
   return normalizePhoneNumberForChatId(value);
 }
@@ -931,10 +1296,15 @@ function normalizeString(value) {
 }
 
 module.exports = {
+  handleDeleteMessages,
   handleDeleteMessage,
+  handleDeleteOpponentMessages,
   handleDeleteOpponentMessage,
   handleDeliveredMessage,
   handleEditMessage,
+  handleForwardMessages,
+  handlePinMessages,
+  handleUnpinMessages,
   handleSendMessage,
   handleSeenMessage,
   saveCallMessage,
