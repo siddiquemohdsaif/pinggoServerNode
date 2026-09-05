@@ -21,6 +21,7 @@ const otp = require("./routes/otp");
 const profile = require("./routes/profile");
 const signup = require("./routes/signup");
 const chats = require("./routes/chats.js");
+const calls = require("./routes/calls.js");
 const auth = require("./routes/auth");
 const files = require("./routes/files");
 const chatAttachments = require("./routes/chatAttachments");
@@ -55,6 +56,7 @@ authorizedRoutes.use(authMiddleware); // Apply the middleware
 authorizedRoutes.use("/profile", profile);
 authorizedRoutes.use("/chats/attachments", chatAttachments);
 authorizedRoutes.use("/chats", chats);
+authorizedRoutes.use("/calls", calls);
 
 app.use("/", authorizedRoutes); // Use the grouped routes
 

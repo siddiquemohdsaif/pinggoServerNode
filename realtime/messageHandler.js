@@ -1,6 +1,8 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { getUserSocket } = require("./connectionManager");
 const { sendOfflineMessageNotification } = require("./fcmService");
+const { isBlockedBy } = require("../utils/blockUtils");
+const { decodeMessageType, forStorage, chatForInternal } = require("../utils/messageTypes");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -13,8 +15,21 @@ async function handleSendMessage(ws, payload, sendJson) {
   const receiverId = normalizeAccountId(payload.receiverId);
   const text = normalizeString(payload.text);
   const repliedMessageId = normalizeString(payload.repliedMessageId);
-  const messageType = normalizeString(payload.messageType || "text").toLowerCase();
+  let messageType;
+  try {
+    messageType = decodeMessageType(payload.messageType);
+  } catch (_error) {
+    sendMessageFailed(ws, sendJson, { clientMessageId, chatId,
+      message: "messageType must be an integer from 0 through 11." });
+    return;
+  }
   const attachmentId = normalizeString(payload.attachmentId);
+  const attachmentWidth = positiveInteger(payload.attachmentWidth);
+  const attachmentHeight = positiveInteger(payload.attachmentHeight);
+  const attachmentDurationMs = positiveInteger(payload.attachmentDurationMs);
+  const attachmentOrientation = attachmentWidth && attachmentHeight
+    ? (attachmentHeight > attachmentWidth ? "portrait" : "landscape")
+    : normalizeString(payload.attachmentOrientation).toLowerCase();
   const location = normalizeLocation(payload.location);
 
   const validationError = validateSendMessage({
@@ -43,6 +58,11 @@ async function handleSendMessage(ws, payload, sendJson) {
     });
     return;
   }
+  if (await isBlockedBy(senderId, receiverId)) {
+    sendMessageFailed(ws, sendJson, { clientMessageId, chatId,
+      message: "Unblock this contact to send a message." });
+    return;
+  }
 
   // A client retains send_message until it receives message_ack. If the socket
   // drops after persistence but before the ack arrives, acknowledge the
@@ -55,7 +75,9 @@ async function handleSendMessage(ws, payload, sendJson) {
       && normalizeAccountId(item.senderId) === senderId,
     );
     if (existingMessage) {
-      await updateLastMessageForParticipants(existingMessage).catch(() => null);
+      const suppressed = await isBlockedBy(receiverId, senderId);
+      if (suppressed) await updateLastMessage(senderId, chatId, existingMessage).catch(() => null);
+      else await updateLastMessageForParticipants(existingMessage).catch(() => null);
       sendJson(ws, {
         type: "message_ack",
         clientMessageId,
@@ -63,7 +85,7 @@ async function handleSendMessage(ws, payload, sendJson) {
         chatId,
         status: "sent",
         sentTime: existingMessage.sentTime,
-        message: existingMessage,
+        message: forStorage(existingMessage),
       });
       return;
     }
@@ -109,16 +131,29 @@ async function handleSendMessage(ws, payload, sendJson) {
       mimeType: attachment.mimeType,
       size: attachment.size,
       url: attachment.url,
+      ...(attachmentWidth ? { width: attachmentWidth } : {}),
+      ...(attachmentHeight ? { height: attachmentHeight } : {}),
+      ...(["portrait", "landscape"].includes(attachmentOrientation)
+        ? { orientation: attachmentOrientation } : {}),
+      ...(messageType === "video" && attachmentDurationMs
+        ? { durationMs: attachmentDurationMs } : {}),
     };
   }
   if (messageType === "location") message.location = location;
 
   try {
+    const suppressedForReceiver = await isBlockedBy(receiverId, senderId);
     await ensureChatReadyForMessage(chatId, senderId, receiverId);
     await saveMessage(chatId, message);
-    await updateLastMessageForParticipants(message);
-    const receiverTotalUnread = await incrementUnreadCount(receiverId, chatId)
-      .catch(() => null);
+    if (suppressedForReceiver) {
+      message.invisible = [receiverId];
+      await saveMessage(chatId, message);
+      await updateLastMessage(senderId, chatId, message);
+    } else {
+      await updateLastMessageForParticipants(message);
+    }
+    const receiverTotalUnread = suppressedForReceiver ? null
+      : await incrementUnreadCount(receiverId, chatId).catch(() => null);
     if (attachment) {
       const updatedAttachment = { ...attachment, status: "attached", messageId, attachedTime: sentTime };
       delete updatedAttachment._id;
@@ -139,18 +174,18 @@ async function handleSendMessage(ws, payload, sendJson) {
       status: "sent",
       sentTime,
       receiverOnline,
-      message,
+      message: forStorage(message),
     });
 
-    if (receiverSocket) {
+    if (!suppressedForReceiver && receiverSocket) {
       sendJson(receiverSocket, {
         type: "new_message",
-        message,
+        message: forStorage(message),
         ...(receiverTotalUnread === null
           ? {}
           : { total_unread: receiverTotalUnread }),
       });
-    } else {
+    } else if (!suppressedForReceiver) {
       sendFcmWithoutFailingMessage({ receiverId, message });
     }
   } catch (error) {
@@ -335,7 +370,7 @@ async function handleEditMessage(ws, payload, sendJson) {
     messageId,
     text,
     editedTime,
-    message: updatedMessage,
+    message: forStorage(updatedMessage),
   });
 
   notifyMessageReceiver({
@@ -346,7 +381,7 @@ async function handleEditMessage(ws, payload, sendJson) {
       messageId,
       text,
       editedTime,
-      message: updatedMessage,
+      message: forStorage(updatedMessage),
     },
     sendJson,
   });
@@ -415,7 +450,7 @@ async function handleDeleteMessage(ws, payload, sendJson) {
     sendJson(ws, {
       type: "delete_message_ack", chatId, messageId,
       deletedTime: existingMessage.deletedTime || null,
-      message: { ...existingMessage, invisible }, hidden: true,
+      message: forStorage({ ...existingMessage, invisible }), hidden: true,
       skipped: alreadyInvisible,
     });
     return;
@@ -438,7 +473,7 @@ async function handleDeleteMessage(ws, payload, sendJson) {
     chatId,
     messageId,
     deletedTime,
-    message: deletedMessage,
+    message: forStorage(deletedMessage),
   });
 
   notifyMessageReceiver({
@@ -448,7 +483,7 @@ async function handleDeleteMessage(ws, payload, sendJson) {
       chatId,
       messageId,
       deletedTime,
-      message: deletedMessage,
+      message: forStorage(deletedMessage),
     },
     sendJson,
   });
@@ -561,7 +596,7 @@ async function handleDeleteMessages(ws, payload, sendJson) {
   pendingMessageIds.forEach((messageId) => notifyMessageReceiver({
     receiverId: updates[messageId].receiverId,
     payload: { type: "message_deleted", chatId, messageId, deletedTime,
-      message: updates[messageId] },
+      message: forStorage(updates[messageId]) },
     sendJson,
   }));
 }
@@ -712,6 +747,11 @@ async function handleForwardMessages(ws, payload, sendJson) {
         : "Forward destination is invalid.") });
     return;
   }
+  if (await isBlockedBy(senderId, receiverId)) {
+    sendJson(ws, { type: "forward_messages_failed", sourceChatId,
+      destinationChatId, message: "Unblock this contact to send a message." });
+    return;
+  }
   const sourceChat = await getChat(sourceChatId);
   const invalidId = messageIds.find((id) => !sourceChat || !sourceChat[id]
     || !isMessageParticipant(sourceChat[id], ws.userId));
@@ -748,13 +788,20 @@ async function handleForwardMessages(ws, payload, sendJson) {
     if (source.location) forwarded.location = { ...source.location };
     return forwarded;
   });
+  const suppressedForReceiver = await isBlockedBy(receiverId, senderId);
+  if (suppressedForReceiver) {
+    for (const message of newMessages) message.invisible = [receiverId];
+  }
   if (newMessages.length > 0) {
     await updateMessages(destinationChatId,
       Object.fromEntries(newMessages.map((message) => [message.id, message])));
   }
-  for (const message of newMessages) await updateLastMessageForParticipants(message);
+  for (const message of newMessages) {
+    if (suppressedForReceiver) await updateLastMessage(senderId, destinationChatId, message);
+    else await updateLastMessageForParticipants(message);
+  }
   let receiverTotalUnread = null;
-  for (const _message of newMessages) {
+  for (const _message of suppressedForReceiver ? [] : newMessages) {
     receiverTotalUnread = await incrementUnreadCount(receiverId, destinationChatId)
       .catch(() => receiverTotalUnread);
   }
@@ -765,10 +812,10 @@ async function handleForwardMessages(ws, payload, sendJson) {
   sendJson(ws, { type: "forward_messages_ack", sourceChatId, destinationChatId,
     operationId, messages, forwardedMessageIds: pendingMessageIds, skippedMessageIds });
   const receiverSocket = getUserSocket(receiverId);
-  for (let index = 0; index < newMessages.length; index += 1) {
+  for (let index = 0; !suppressedForReceiver && index < newMessages.length; index += 1) {
     const message = newMessages[index];
     if (receiverSocket) sendJson(receiverSocket, {
-      type: "new_message", message,
+      type: "new_message", message: forStorage(message),
       ...(index === newMessages.length - 1 && receiverTotalUnread !== null
         ? { total_unread: receiverTotalUnread } : {}),
     });
@@ -878,7 +925,7 @@ async function handleDeliveredMessage(ws, payload, sendJson) {
 
 async function saveMessage(chatId, message) {
   const result = await firestoreManager.updateDocument("Chats", chatId, "/", {
-    [message.id]: message,
+    [message.id]: forStorage(message),
   });
 
   if (!result) {
@@ -890,7 +937,8 @@ async function saveMessage(chatId, message) {
 
 async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType, text,
   callerText, receiverText,
-  durationSeconds, createdAt, ringingAt, connectedAt, endedAt, terminationReason }, sendJson) {
+  durationSeconds, createdAt, ringingAt, connectedAt, endedAt, terminationReason,
+  suppressedForReceiver = false }, sendJson) {
   if (!callId || !chatId || !callerId || !receiverId || !text) return null;
   const existingChat = await getChat(chatId);
   const existingMessage = existingChat && Object.values(existingChat).find((item) =>
@@ -898,7 +946,13 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
       item.messageType === (mediaType === "video" ? "video_call" : "voice_call"),
   );
   if (existingMessage) {
-    await updateLastMessageForParticipants(existingMessage).catch(() => null);
+    if (suppressedForReceiver) {
+      await updateLastMessage(callerId, chatId, {
+        ...existingMessage, text: existingMessage.callerText || existingMessage.text,
+      }).catch(() => null);
+    } else {
+      await updateLastMessageForParticipants(existingMessage).catch(() => null);
+    }
     return existingMessage;
   }
   const sentTime = nextMessageTimestamp();
@@ -912,25 +966,37 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
     callEndedAt: endedAt || null, callTerminationReason: terminationReason || "unknown",
     sentTime, deliveredTime: null,
     readTime: null, status: "sent",
+    invisible: suppressedForReceiver ? [receiverId] : [],
   };
-  await ensureChatReadyForMessage(chatId, callerId, receiverId);
+  await ensureChatReadyForMessage(
+    chatId, callerId, receiverId, !suppressedForReceiver,
+  );
   await saveMessage(chatId, message);
-  await updateLastMessageForParticipants(message);
-  const receiverTotalUnread = await incrementUnreadCount(receiverId, chatId)
-    .catch(() => null);
-  for (const userId of [callerId, receiverId]) {
+  if (suppressedForReceiver) {
+    await updateLastMessage(callerId, chatId, {
+      ...message, text: message.callerText || message.text,
+    });
+  } else {
+    await updateLastMessageForParticipants(message);
+  }
+  const receiverTotalUnread = suppressedForReceiver ? null
+    : await incrementUnreadCount(receiverId, chatId).catch(() => null);
+  const visibleUsers = suppressedForReceiver ? [callerId] : [callerId, receiverId];
+  for (const userId of visibleUsers) {
     const socket = getUserSocket(userId);
     const participantMessage = { ...message,
       text: userId === callerId ? message.callerText : message.receiverText };
     if (socket) sendJson(socket, {
       type: "new_message",
-      message: participantMessage,
+      message: forStorage(participantMessage),
       ...(userId === receiverId && receiverTotalUnread !== null
         ? { total_unread: receiverTotalUnread }
         : {}),
     });
   }
-  if (!getUserSocket(receiverId)) sendFcmWithoutFailingMessage({ receiverId, message });
+  if (!suppressedForReceiver && !getUserSocket(receiverId)) {
+    sendFcmWithoutFailingMessage({ receiverId, message });
+  }
   return message;
 }
 
@@ -941,16 +1007,15 @@ function nextMessageTimestamp() {
   return timestamp;
 }
 
-async function ensureChatReadyForMessage(chatId, senderId, receiverId) {
+async function ensureChatReadyForMessage(chatId, senderId, receiverId, includeReceiver = true) {
   const chat = await getChat(chatId);
   if (!chat) {
     await createChatDocument(chatId);
   }
 
-  await Promise.all([
-    addChatIdToChatsList(senderId, chatId),
-    addChatIdToChatsList(receiverId, chatId),
-  ]);
+  const participants = [addChatIdToChatsList(senderId, chatId)];
+  if (includeReceiver) participants.push(addChatIdToChatsList(receiverId, chatId));
+  await Promise.all(participants);
 }
 
 async function createChatDocument(chatId) {
@@ -1038,7 +1103,7 @@ async function updateLastMessage(userId, chatId, message) {
   ) {
     return;
   }
-  settings.last_message = { ...message };
+  settings.last_message = forStorage(message);
   await firestoreManager.updateDocument("ChatsList", accountId, "/", {
     ...withoutDocumentId(existingDoc),
     list: { ...list, [chatId]: settings },
@@ -1083,7 +1148,9 @@ function withoutDocumentId(document) {
 
 async function getChat(chatId) {
   try {
-    return (await firestoreManager.readDocument("Chats", chatId, "/")) || null;
+    const stored = (await firestoreManager.readDocument("Chats", chatId, "/")) || null;
+    if (!stored) return null;
+    return chatForInternal(stored);
   } catch (error) {
     return null;
   }
@@ -1098,11 +1165,14 @@ async function getChatsList(userId) {
 }
 
 async function updateMessages(chatId, messages) {
+  const storedMessages = Object.fromEntries(Object.entries(messages || {}).map(
+    ([key, value]) => [key, forStorage(value)],
+  ));
   const result = await firestoreManager.updateDocument(
     "Chats",
     chatId,
     "/",
-    messages,
+    storedMessages,
   );
   if (!result) {
     throw new Error("Messages could not be updated.");
@@ -1293,6 +1363,11 @@ function normalizeString(value) {
     return "";
   }
   return value.trim();
+}
+
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : null;
 }
 
 module.exports = {

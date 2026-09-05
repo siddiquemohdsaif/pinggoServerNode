@@ -1,5 +1,9 @@
 const express = require("express");
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { getUserSocket } = require("../realtime/connectionManager");
+const { isBlockedBy, setBlocked } = require("../utils/blockUtils");
+const { chatForClient, chatForInternal, forStorage } = require("../utils/messageTypes");
+const { reportForStorage, reportForInternal } = require("../utils/specializedRecords");
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
 
@@ -28,7 +32,7 @@ router.post("/list", async (req, res) => {
       const page = paginateChatList(userDoc.list, pageSize, cursor);
       const [userProfiles, messageCache] = await Promise.all([
         getOtherUserProfilesFromChatList(page.chatList, phoneNumber),
-        getRecentMessageCache(page.chatList, messageCacheSize),
+        getRecentMessageCache(page.chatList, messageCacheSize, phoneNumber),
       ]);
 
       return res.status(200).json({
@@ -90,17 +94,18 @@ router.post("/getChat", async (req, res) => {
       );
 
       if (paginated) {
-        const page = paginateChatMessages(chatDoc, chatId, pageSize, cursor);
-        const pinnedMessages = cursor ? [] : getPinnedChatMessages(chatDoc, chatId);
+        const page = paginateChatMessages(chatDoc, chatId, pageSize, cursor, phoneNumber);
+        const pinnedMessages = cursor ? [] : getPinnedChatMessages(chatDoc, chatId, phoneNumber);
         return res.status(200).json({
           success: true,
-          pinnedMessages,
-          messages: page.messages,
+          pinnedMessages: pinnedMessages.map(forStorage),
+          messages: page.messages.map(forStorage),
           replyMessages: getReplyMessagesForPage(
             chatDoc,
             chatId,
             [...page.messages, ...pinnedMessages],
-          ),
+            phoneNumber,
+          ).map(forStorage),
           nextCursor: page.nextCursor,
           hasMore: page.hasMore,
           userProfile,
@@ -108,7 +113,7 @@ router.post("/getChat", async (req, res) => {
       }
 
       // Keep the old response available to clients that do not request pagination.
-      return res.status(200).json({ success: true, chat: chatDoc, userProfile });
+      return res.status(200).json({ success: true, chat: chatForClient(chatDoc), userProfile });
     }
 
     return res.status(404).json({ success: false, message: "No user found." });
@@ -117,6 +122,159 @@ router.post("/getChat", async (req, res) => {
     return res.status(400).json({ success: false, message: error.message });
   }
 });
+
+router.post("/clear", async (req, res) => {
+  try {
+    const phoneNumber = normalizePhoneNumber(
+      req.body.phoneNumber || req.body.phone_number || req.body.phone,
+    );
+    const chatId = normalizeString(req.body.chatId);
+    const validationError = validatePhoneNumber({ phoneNumber }) ||
+      validateChatParticipant(phoneNumber, chatId);
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+    const chat = await getSingleChatByChatId(chatId);
+    if (!chat) return res.status(404).json({ success: false, message: "Chat not found." });
+
+    const updates = {};
+    for (const [id, message] of Object.entries(chat)) {
+      if (!isStoredMessage(message)) continue;
+      updates[id] = forStorage({
+        ...message,
+        invisible: addInvisibleNumber(message.invisible, phoneNumber),
+      });
+    }
+    if (Object.keys(updates).length > 0) {
+      await firestoreManager.updateDocument("Chats", chatId, "/", updates);
+    }
+    await clearChatListPreview(phoneNumber, chatId);
+    pushChatCleared(phoneNumber, chatId);
+    return res.status(200).json({ success: true, chatId, cleared: true });
+  } catch (error) {
+    console.error("Error clearing chat:", error.message);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+router.post("/report", async (req, res) => {
+  try {
+    const phoneNumber = normalizePhoneNumber(
+      req.body.phoneNumber || req.body.phone_number || req.body.phone,
+    );
+    const chatId = normalizeString(req.body.chatId);
+    const reason = normalizeString(req.body.reason);
+    const validationError = validatePhoneNumber({ phoneNumber }) ||
+      validateChatParticipant(phoneNumber, chatId) ||
+      (!reason ? "reason is required." : null);
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+    const chat = await getSingleChatByChatId(chatId);
+    if (!chat) return res.status(404).json({ success: false, message: "Chat not found." });
+
+    const receiverId = getOtherPhoneNumberFromChatId(chatId, phoneNumber);
+    const sentTime = Date.now();
+    const messageId = `${sentTime}`;
+    const message = {
+      id: messageId,
+      chatId,
+      senderId: phoneNumber,
+      receiverId,
+      messageType: 9,
+      // The client renders this as a system pill, never as a normal message bubble.
+      text: `${phoneNumber} reported ${receiverId}`,
+      reportReason: reason,
+      sentTime,
+      status: "sent",
+      invisible: [],
+    };
+    await firestoreManager.updateDocument("Chats", chatId, "/", {
+      [messageId]: forStorage(message),
+    });
+
+    let reportDocument = null;
+    try {
+      reportDocument = await firestoreManager.readDocument("Reports", chatId, "/");
+    } catch (_error) {
+      reportDocument = null;
+    }
+    const decodedReport = reportDocument ? reportForInternal(reportDocument) : null;
+    const reports = decodedReport ? decodedReport.messages : [];
+    const storedReport = { messageId, reporterId: phoneNumber, reportedUserId: receiverId,
+      reason, createdAt: sentTime };
+    const document = reportForStorage({ chatId, messages: [...reports, storedReport] });
+    if (reportDocument) {
+      await firestoreManager.updateDocument("Reports", chatId, "/", document);
+    } else {
+      await firestoreManager.createDocument("Reports", chatId, "/", document);
+    }
+    await Promise.all([
+      updateReportLastMessage(phoneNumber, chatId, message),
+      updateReportLastMessage(receiverId, chatId, message),
+    ]);
+    pushNewMessage(phoneNumber, message);
+    pushNewMessage(receiverId, message);
+    return res.status(200).json({ success: true, chatId, message: forStorage(message) });
+  } catch (error) {
+    console.error("Error reporting chat:", error.message);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+router.post("/block-status", async (req, res) => {
+  try {
+    const phoneNumber = normalizePhoneNumber(req.body.phoneNumber || req.body.phone);
+    const chatId = normalizeString(req.body.chatId);
+    const validationError = validatePhoneNumber({ phoneNumber }) ||
+      validateChatParticipant(phoneNumber, chatId);
+    if (validationError) return res.status(400).json({ success: false, message: validationError });
+    const opponentId = getOtherPhoneNumberFromChatId(chatId, phoneNumber);
+    return res.status(200).json({ success: true, chatId,
+      blocked: await isBlockedBy(phoneNumber, opponentId) });
+  } catch (error) {
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+router.post("/block", async (req, res) => changeBlockState(req, res, true));
+router.post("/unblock", async (req, res) => changeBlockState(req, res, false));
+
+async function changeBlockState(req, res, blocked) {
+  try {
+    const phoneNumber = normalizePhoneNumber(req.body.phoneNumber || req.body.phone);
+    const chatId = normalizeString(req.body.chatId);
+    const validationError = validatePhoneNumber({ phoneNumber }) ||
+      validateChatParticipant(phoneNumber, chatId);
+    if (validationError) return res.status(400).json({ success: false, message: validationError });
+    const opponentId = getOtherPhoneNumberFromChatId(chatId, phoneNumber);
+    const updatedAt = await setBlocked(phoneNumber, opponentId, chatId, blocked);
+    pushBlockStatus(phoneNumber, chatId, opponentId, blocked, updatedAt);
+    let message = null;
+    {
+      const action = blocked ? "blocked" : "unblocked";
+      const messageId = `${blocked ? "block" : "unblock"}_${updatedAt}_${Math.random().toString(36).slice(2, 10)}`;
+      message = { id: messageId, chatId, senderId: phoneNumber, receiverId: opponentId,
+        messageType: blocked ? "chat_block" : "chat_unblock",
+        text: `${phoneNumber} ${action} ${opponentId}`,
+        sentTime: updatedAt, status: "sent", invisible: [] };
+      await firestoreManager.updateDocument("Chats", chatId, "/", {
+        [messageId]: forStorage(message),
+      });
+      await Promise.all([
+        updateReportLastMessage(phoneNumber, chatId, message),
+        updateReportLastMessage(opponentId, chatId, message),
+      ]);
+      pushNewMessage(phoneNumber, message);
+      pushNewMessage(opponentId, message);
+    }
+    return res.status(200).json({ success: true, chatId, opponentId, blocked,
+      message: forStorage(message) });
+  } catch (error) {
+    console.error(`Error ${blocked ? "blocking" : "unblocking"} chat:`, error.message);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+}
 
 router.post("/settings", async (req, res) => {
   try {
@@ -174,6 +332,8 @@ router.post("/settings", async (req, res) => {
       "/",
       updatedDocument,
     );
+
+    pushChatSetting(phoneNumber, chatId, setting, storedValue);
 
     return res.status(200).json({ success: true, chatId, settings });
   } catch (error) {
@@ -238,6 +398,12 @@ router.post("/settings/bulk", async (req, res) => {
       "/",
       { ...withoutDocumentId(chatsListDoc), list: updatedList },
     );
+    if (setting !== "delete") {
+      const storedValue = setting === "mute" ? value : Boolean(value);
+      for (const chatId of chatIds) {
+        pushChatSetting(phoneNumber, chatId, setting, storedValue);
+      }
+    }
     return res.status(200).json({
       success: true,
       chatIds,
@@ -294,7 +460,7 @@ router.post("/sync", async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      messages,
+      messages: messages.map(forStorage),
       chatList: chatsListDoc.list || {},
       syncTime: Date.now(),
     });
@@ -385,7 +551,7 @@ async function getChatsListByPhoneNumber(phoneNumber) {
 async function getSingleChatByChatId(chatId) {
   try {
     const userDoc = await firestoreManager.readDocument("Chats", chatId, "/");
-    return userDoc || false;
+    return userDoc ? chatForInternal(userDoc) : false;
   } catch (error) {
     return false;
   }
@@ -500,14 +666,16 @@ function getMessagesFromChatDocument(
     }));
 }
 
-function getPageableMessagesFromChatDocument(chat, chatId) {
+function getPageableMessagesFromChatDocument(chat, chatId, accountId) {
   if (!chat || typeof chat !== "object") return [];
   return Object.entries(chat)
     .filter(([, value]) =>
       value &&
       typeof value === "object" &&
       Object.prototype.hasOwnProperty.call(value, "text") &&
-      Number.isFinite(Number(value.sentTime)),
+      Number.isFinite(Number(value.sentTime)) &&
+      (!accountId || isSharedBlockEvent(value) ||
+        !includesInvisibleNumber(value.invisible, accountId)),
     )
     .map(([documentKey, message]) => ({
       ...message,
@@ -522,8 +690,8 @@ function compareMessageSortEntries(first, second) {
   return second.id.localeCompare(first.id);
 }
 
-function paginateChatMessages(chat, chatId, pageSize, cursor) {
-  const entries = getPageableMessagesFromChatDocument(chat, chatId)
+function paginateChatMessages(chat, chatId, pageSize, cursor, accountId) {
+  const entries = getPageableMessagesFromChatDocument(chat, chatId, accountId)
     .sort(compareMessageSortEntries);
   const startIndex = cursor
     ? entries.findIndex((entry) => compareMessageSortEntries(entry, cursor) > 0)
@@ -541,7 +709,7 @@ function paginateChatMessages(chat, chatId, pageSize, cursor) {
   };
 }
 
-function getReplyMessagesForPage(chat, chatId, pageMessages) {
+function getReplyMessagesForPage(chat, chatId, pageMessages, accountId) {
   if (!Array.isArray(pageMessages) || pageMessages.length === 0) return [];
   const pageIds = new Set(pageMessages
     .map((message) => normalizeString(message && message.id))
@@ -550,12 +718,12 @@ function getReplyMessagesForPage(chat, chatId, pageMessages) {
     .map((message) => normalizeString(message && message.repliedMessageId))
     .filter((messageId) => messageId && !pageIds.has(messageId)));
   if (replyIds.size === 0) return [];
-  return getPageableMessagesFromChatDocument(chat, chatId)
+  return getPageableMessagesFromChatDocument(chat, chatId, accountId)
     .filter((message) => replyIds.has(message.id));
 }
 
-function getPinnedChatMessages(chat, chatId) {
-  return getPageableMessagesFromChatDocument(chat, chatId)
+function getPinnedChatMessages(chat, chatId, accountId) {
+  return getPageableMessagesFromChatDocument(chat, chatId, accountId)
     .filter((message) => (Array.isArray(message.pinned) && message.pinned.length > 0)
       || message.pinned === true || message.pinned === "true")
     .sort((first, second) => {
@@ -566,7 +734,7 @@ function getPinnedChatMessages(chat, chatId) {
     });
 }
 
-async function getRecentMessageCache(chatList, cacheSize) {
+async function getRecentMessageCache(chatList, cacheSize, accountId) {
   if (cacheSize <= 0) return {};
   const chatIds = getChatIdsFromChatList(chatList);
   if (chatIds.length === 0) return {};
@@ -581,7 +749,8 @@ async function getRecentMessageCache(chatList, cacheSize) {
     return Object.fromEntries(
       chatIds.map((chatId) => [
         chatId,
-        paginateChatMessages(chatsById[chatId], chatId, cacheSize, null).messages,
+        paginateChatMessages(chatForInternal(chatsById[chatId]), chatId,
+          cacheSize, null, accountId).messages.map(forStorage),
       ]),
     );
   } catch (error) {
@@ -600,11 +769,18 @@ function isChatMessageForSync(value, normalizedAccountId, lastSyncTime) {
   if (value.sentTime <= lastSyncTime) {
     return false;
   }
+  if (!isSharedBlockEvent(value) &&
+      includesInvisibleNumber(value.invisible, normalizedAccountId)) return false;
 
   const senderId = normalizePhoneNumberForChatId(value.senderId);
   const receiverId = normalizePhoneNumberForChatId(value.receiverId);
 
   return senderId === normalizedAccountId || receiverId === normalizedAccountId;
+}
+
+function isSharedBlockEvent(message) {
+  const type = normalizeString(message && message.messageType).toLowerCase();
+  return type === "chat_block" || type === "chat_unblock";
 }
 
 async function getOtherUserProfileFromChatId(chatId, phoneNumber) {
@@ -875,6 +1051,113 @@ function validateChatSetting({ phoneNumber, chatId, setting, value }) {
     return "mute value must be 0, -1, or a future timestamp.";
   }
   return null;
+}
+
+function validateChatParticipant(phoneNumber, chatId) {
+  if (!chatId) return "chatId is required.";
+  if (!chatId.split("_").map(normalizePhoneNumberForChatId).includes(phoneNumber)) {
+    return "phoneNumber must be a participant in chatId.";
+  }
+  return null;
+}
+
+function isStoredMessage(value) {
+  return value && typeof value === "object" &&
+    Object.prototype.hasOwnProperty.call(value, "text") &&
+    Number.isFinite(Number(value.sentTime));
+}
+
+function invisibleNumbers(values) {
+  return Array.isArray(values)
+    ? values.map(normalizePhoneNumberForChatId).filter(Boolean) : [];
+}
+
+function includesInvisibleNumber(values, userId) {
+  return invisibleNumbers(values).includes(normalizePhoneNumberForChatId(userId));
+}
+
+function addInvisibleNumber(values, userId) {
+  return [...new Set([...invisibleNumbers(values), normalizePhoneNumberForChatId(userId)])]
+    .filter(Boolean);
+}
+
+function pushChatSetting(phoneNumber, chatId, setting, value) {
+  const socket = getUserSocket(phoneNumber);
+  if (!socket || socket.readyState !== 1) return;
+  socket.send(JSON.stringify({
+    type: "chat_settings_updated",
+    chatId,
+    setting,
+    value,
+    updatedAt: Date.now(),
+  }));
+}
+
+function pushBlockStatus(phoneNumber, chatId, opponentId, blocked, updatedAt) {
+  const socket = getUserSocket(phoneNumber);
+  if (!socket || socket.readyState !== 1) return;
+  socket.send(JSON.stringify({ type: "chat_block_status", chatId, opponentId,
+    blocked, updatedAt }));
+}
+
+function pushNewMessage(userId, message) {
+  const socket = getUserSocket(userId);
+  if (!socket || socket.readyState !== 1) return;
+  socket.send(JSON.stringify({ type: "new_message", message: forStorage(message) }));
+}
+
+function pushChatCleared(phoneNumber, chatId) {
+  const socket = getUserSocket(phoneNumber);
+  if (!socket || socket.readyState !== 1) return;
+  socket.send(JSON.stringify({ type: "chat_cleared", chatId, clearedAt: Date.now() }));
+}
+
+async function clearChatListPreview(userId, chatId) {
+  const accountId = formatPhoneNumberForAccountId(userId);
+  const existingDoc = await getChatsListByPhoneNumber(accountId);
+  if (!existingDoc) return;
+  const existingList = existingDoc.list;
+  const list = Array.isArray(existingList)
+    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
+    : existingList && typeof existingList === "object" ? existingList : {};
+  if (!Object.prototype.hasOwnProperty.call(list, chatId)) return;
+  const previousLastMessage = list[chatId] && list[chatId].last_message;
+  const settings = {
+    ...defaultChatSettings(),
+    ...(list[chatId] || {}),
+    last_message: previousLastMessage && typeof previousLastMessage === "object"
+      ? {
+        ...previousLastMessage,
+        id: "",
+        text: "",
+        messageType: 0,
+        cleared: true,
+        attachment: null,
+        attachmentName: null,
+      }
+      : null,
+    unread_count: 0,
+  };
+  await firestoreManager.updateDocument("ChatsList", accountId, "/", {
+    ...withoutDocumentId(existingDoc),
+    list: { ...list, [chatId]: settings },
+  });
+}
+
+async function updateReportLastMessage(userId, chatId, message) {
+  const accountId = formatPhoneNumberForAccountId(userId);
+  const existingDoc = await getChatsListByPhoneNumber(accountId);
+  if (!existingDoc) return;
+  const existingList = existingDoc.list;
+  const list = Array.isArray(existingList)
+    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
+    : existingList && typeof existingList === "object" ? existingList : {};
+  const settings = { ...defaultChatSettings(), ...(list[chatId] || {}) };
+  settings.last_message = forStorage(message);
+  await firestoreManager.updateDocument("ChatsList", accountId, "/", {
+    ...withoutDocumentId(existingDoc),
+    list: { ...list, [chatId]: settings },
+  });
 }
 
 function validateBulkChatSetting({ phoneNumber, chatIds, setting, value }) {

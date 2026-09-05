@@ -2,12 +2,21 @@ const FirestoreManager = require("./Firestore/FirestoreManager");
 
 const firestoreManager = FirestoreManager.getInstance();
 
+// Keep this list synchronized with the collections used by routes/, realtime/, models/, and utils/.
+// Chats contains every message type (0..11), including voice_call and video_call timeline messages.
+// CallLogs contains the per-user detailed call history written by models/CallLogStore.js.
+// ChatAttachments contains metadata only; this script does not delete uploaded files from disk/storage.
+// AppConfiguration is intentionally preserved because the server requires it after a database reset.
 const COLLECTIONS_TO_CLEAN = [
-    // "P-ID-MAP",
-    // "EmailOtp",
-    // "Chats",
-    // "Users",
-    // "ChatsList",
+    "ChatAttachments",
+    "CallLogs",
+    "Reports",
+    "UserBlocks",
+    "Chats",
+    "ChatsList",
+    "EmailOtp",
+    "P-ID-MAP",
+    "Users",
 ];
 
 const cleanCollection = async (collectionName) => {
@@ -31,15 +40,30 @@ const cleanCollection = async (collectionName) => {
 
         await new Promise((resolve) => setTimeout(resolve, 100));
     }
+
+    if (documentIds.length === 0) {
+        console.log(`${collectionName}: already empty`);
+    }
+
+    return documentIds.length;
 };
 
 const cleanDB = async () => {
+    let totalDeleted = 0;
+    const summary = {};
+
     for (const collectionName of COLLECTIONS_TO_CLEAN) {
         console.log(`Cleaning: ${collectionName}`);
-        await cleanCollection(collectionName);
+        const deleted = await cleanCollection(collectionName);
+        summary[collectionName] = deleted;
+        totalDeleted += deleted;
     }
 
     console.log("Database cleanup complete.");
+    for (const [collectionName, deleted] of Object.entries(summary)) {
+        console.log(`  ${collectionName}: ${deleted} document(s)`);
+    }
+    console.log(`Total deleted: ${totalDeleted} document(s)`);
 };
 
 cleanDB().catch((error) => {

@@ -1,6 +1,8 @@
 const { randomUUID, createHash } = require("crypto");
 const { getUserSocket } = require("./connectionManager");
 const { saveCallMessage } = require("./messageHandler");
+const { saveCallLog } = require("../models/CallLogStore");
+const { isBlockedBy } = require("../utils/blockUtils");
 
 const calls = new Map();
 const callEndedListeners = new Set();
@@ -91,7 +93,7 @@ async function handleCallEvent(ws, payload, sendJson) {
   return true;
 }
 
-function handleInvite(ws, payload, sendJson) {
+async function handleInvite(ws, payload, sendJson) {
   const receiverId = account(payload.receiverId);
   const requestedCallId = string(payload.callId);
   const chatId = string(payload.chatId);
@@ -112,6 +114,11 @@ function handleInvite(ws, payload, sendJson) {
   }
   if (!validChatId(chatId, ws.userId, receiverId)) {
     sendJson(ws, { type: "call_failed", callId: requestedCallId, message: "Valid chatId is required." });
+    return true;
+  }
+  if (await isBlockedBy(ws.userId, receiverId)) {
+    sendJson(ws, { type: "call_failed", callId: requestedCallId,
+      message: "Unblock this contact to make a call." });
     return true;
   }
 
@@ -149,9 +156,11 @@ function handleInvite(ws, payload, sendJson) {
   }
 
   const callId = requestedCallId || randomUUID();
-  const receiverSocket = getUserSocket(receiverId);
+  const suppressedForReceiver = await isBlockedBy(receiverId, ws.userId);
+  const receiverSocket = suppressedForReceiver ? null : getUserSocket(receiverId);
   const call = { callId, chatId, callerId: ws.userId, receiverId, mediaType,
     state: receiverSocket ? "ringing" : "calling", offer: payload.sdp,
+    suppressedForReceiver,
     createdAt: Date.now(), ringingAt: receiverSocket ? Date.now() : null,
     connectedAt: null, endedAt: null, terminationReason: null,
     updatedAt: Date.now(), pendingCandidates: [] };
@@ -171,7 +180,8 @@ function deliverPendingCallsForUser(userId, sendJson) {
   const socket = getUserSocket(normalizedUserId);
   if (!socket) return;
   for (const call of calls.values()) {
-    if (call.receiverId !== normalizedUserId || call.state !== "calling") continue;
+    if (call.receiverId !== normalizedUserId || call.state !== "calling"
+        || call.suppressedForReceiver) continue;
     call.state = "ringing";
     if (!call.ringingAt) call.ringingAt = Date.now();
     call.updatedAt = Date.now();
@@ -320,12 +330,18 @@ async function finalizeCallMessage(call, sendJson) {
   const callerText = call.connectedAt ? text : `[${label}] didn't connect`;
   const receiverText = call.connectedAt ? text : `[${label}] missed`;
   try {
+    await saveCallLog(call);
+  } catch (error) {
+    console.error("Could not save call log:", error.message);
+  }
+  try {
     await saveCallMessage({ callId: call.callId, chatId: call.chatId,
       callerId: call.callerId, receiverId: call.receiverId, mediaType: call.mediaType,
       text, callerText, receiverText, durationSeconds,
       createdAt: call.createdAt, ringingAt: call.ringingAt,
       connectedAt: call.connectedAt, endedAt: call.endedAt,
-      terminationReason: call.terminationReason || "unknown" }, sendJson);
+      terminationReason: call.terminationReason || "unknown",
+      suppressedForReceiver: Boolean(call.suppressedForReceiver) }, sendJson);
   } catch (error) {
     call.messageSaved = false;
     console.error("Could not save voice call message:", error.message);
