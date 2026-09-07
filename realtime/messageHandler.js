@@ -1,8 +1,9 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
-const { getUserSocket } = require("./connectionManager");
+const { getUserSocket, isUserViewingChat } = require("./connectionManager");
 const { sendOfflineMessageNotification } = require("./fcmService");
 const { isBlockedBy } = require("../utils/blockUtils");
 const { decodeMessageType, forStorage, chatForInternal } = require("../utils/messageTypes");
+const { nextTimestamp } = require("../utils/timestampId");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -104,7 +105,7 @@ async function handleSendMessage(ws, payload, sendJson) {
     }
   }
 
-  const sentTime = nextMessageTimestamp();
+  const sentTime = nextTimestamp();
   const messageId = String(sentTime);
   const message = {
     id: messageId,
@@ -185,7 +186,8 @@ async function handleSendMessage(ws, payload, sendJson) {
           ? {}
           : { total_unread: receiverTotalUnread }),
       });
-    } else if (!suppressedForReceiver) {
+    }
+    if (!suppressedForReceiver && !isUserViewingChat(receiverId, chatId)) {
       sendFcmWithoutFailingMessage({ receiverId, message });
     }
   } catch (error) {
@@ -211,9 +213,12 @@ async function sendFcmWithoutFailingMessage({ receiverId, message }) {
 
 async function handleSeenMessage(ws, payload, sendJson) {
   const chatId = normalizeString(payload.chatId);
-  const messageIds = payload.messageIds || payload.messageIdList;
+  const markAll = payload.markAll === true;
+  let messageIds = payload.messageIds || payload.messageIdList;
 
-  const validationError = validateMessageIdsRequest({ chatId, messageIds });
+  const validationError = markAll
+    ? (!chatId ? "Chat id is required." : null)
+    : validateMessageIdsRequest({ chatId, messageIds });
   if (validationError) {
     sendJson(ws, {
       type: "message_seen_failed",
@@ -231,6 +236,17 @@ async function handleSeenMessage(ws, payload, sendJson) {
       message: "No chat found.",
     });
     return;
+  }
+
+  if (markAll) {
+    const authenticatedUserId = normalizePhoneNumberForChatId(ws.userId);
+    messageIds = Object.entries(chat)
+      .filter(([, message]) => {
+        return message &&
+          normalizePhoneNumberForChatId(message.receiverId) === authenticatedUserId &&
+          (message.readTime === null || message.readTime === undefined);
+      })
+      .map(([messageId]) => messageId);
   }
 
   const missingMessageId = messageIds.find((messageId) => !chat[messageId]);
@@ -268,7 +284,9 @@ async function handleSeenMessage(ws, payload, sendJson) {
     return updates;
   }, {});
 
-  await updateMessages(chatId, updatedMessages);
+  if (messageIds.length > 0) {
+    await updateMessages(chatId, updatedMessages);
+  }
   const latestSeenMessage = latestMessage(Object.values(updatedMessages));
   if (latestSeenMessage) {
     await updateLastMessageForParticipants(latestSeenMessage);
@@ -774,7 +792,7 @@ async function handleForwardMessages(ws, payload, sendJson) {
     !existingBySourceId.has(sourceId) && !isDeletedMessage(sourceChat[sourceId]));
   const newMessages = pendingMessageIds.map((sourceId) => {
     const source = sourceChat[sourceId];
-    const sentTime = nextMessageTimestamp();
+    const sentTime = nextTimestamp();
     const forwarded = {
       id: String(sentTime), clientMessageId: null, chatId: destinationChatId,
       senderId, receiverId, text: normalizeString(source.text),
@@ -819,7 +837,9 @@ async function handleForwardMessages(ws, payload, sendJson) {
       ...(index === newMessages.length - 1 && receiverTotalUnread !== null
         ? { total_unread: receiverTotalUnread } : {}),
     });
-    else sendFcmWithoutFailingMessage({ receiverId, message });
+    if (!isUserViewingChat(receiverId, destinationChatId)) {
+      sendFcmWithoutFailingMessage({ receiverId, message });
+    }
   }
 }
 
@@ -955,7 +975,7 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
     }
     return existingMessage;
   }
-  const sentTime = nextMessageTimestamp();
+  const sentTime = nextTimestamp();
   const message = {
     id: String(sentTime), clientMessageId: null, callId, chatId,
     senderId: callerId, receiverId, text,
@@ -994,17 +1014,9 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
         : {}),
     });
   }
-  if (!suppressedForReceiver && !getUserSocket(receiverId)) {
-    sendFcmWithoutFailingMessage({ receiverId, message });
-  }
+  // Call notifications are emitted by callHandler so completed calls never
+  // appear as ordinary message notifications.
   return message;
-}
-
-let lastMessageTimestamp = 0;
-function nextMessageTimestamp() {
-  const timestamp = Math.max(Date.now(), lastMessageTimestamp + 1);
-  lastMessageTimestamp = timestamp;
-  return timestamp;
 }
 
 async function ensureChatReadyForMessage(chatId, senderId, receiverId, includeReceiver = true) {

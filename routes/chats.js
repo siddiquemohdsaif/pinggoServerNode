@@ -113,7 +113,11 @@ router.post("/getChat", async (req, res) => {
       }
 
       // Keep the old response available to clients that do not request pagination.
-      return res.status(200).json({ success: true, chat: chatForClient(chatDoc), userProfile });
+      return res.status(200).json({
+        success: true,
+        chat: chatForClient(chatForParticipant(chatDoc, phoneNumber)),
+        userProfile,
+      });
     }
 
     return res.status(404).json({ success: false, message: "No user found." });
@@ -663,6 +667,7 @@ function getMessagesFromChatDocument(
     .map((message) => ({
       ...message,
       chatId: message.chatId || chatId,
+      text: callTextForParticipant(message, normalizedAccountId),
     }));
 }
 
@@ -682,7 +687,29 @@ function getPageableMessagesFromChatDocument(chat, chatId, accountId) {
       id: normalizeString(message.id) || documentKey,
       chatId: message.chatId || chatId,
       sentTime: Number(message.sentTime),
+      text: callTextForParticipant(message, accountId),
     }));
+}
+
+function callTextForParticipant(message, accountId) {
+  if (!message || !accountId) return message && message.text;
+  const type = normalizeString(message.messageType).toLowerCase();
+  if (type !== "voice_call" && type !== "video_call") return message.text;
+  const caller = normalizePhoneNumberForChatId(message.senderId);
+  const own = caller === normalizePhoneNumberForChatId(accountId);
+  return own
+    ? (message.callerText || message.text)
+    : (message.receiverText || message.text);
+}
+
+function chatForParticipant(chat, accountId) {
+  if (!chat || typeof chat !== "object") return chat;
+  return Object.fromEntries(Object.entries(chat).map(([key, value]) => [
+    key,
+    key === "_id" || !value || typeof value !== "object"
+      ? value
+      : { ...value, text: callTextForParticipant(value, accountId) },
+  ]));
 }
 
 function compareMessageSortEntries(first, second) {

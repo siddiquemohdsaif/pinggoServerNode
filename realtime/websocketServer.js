@@ -4,6 +4,7 @@ const {
   addUser,
   removeUser,
   getOnlineUserCount,
+  setActiveChat,
 } = require("./connectionManager");
 const {
   handleDeleteMessages,
@@ -157,6 +158,16 @@ async function handleMessage(ws, rawMessage) {
 
   if (message.type === "message_delivered") {
     await handleDeliveredMessage(ws, message, sendJson);
+    return;
+  }
+
+  if (message.type === "active_chat") {
+    const chatId = typeof message.chatId === "string" ? message.chatId.trim() : "";
+    setActiveChat(ws.userId, ws, chatId);
+    sendJson(ws, {
+      type: "active_chat_ack",
+      chatId,
+    });
     return;
   }
 

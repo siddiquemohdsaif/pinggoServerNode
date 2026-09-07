@@ -54,6 +54,10 @@ router.post("/", async (req, res) => {
       list: {},
     });
 
+    await firestoreManager.createDocument("CallsList", accountId, "/", {
+      list: {},
+    });
+
     return res.status(200).json({
       success: true,
       userData: userModel,

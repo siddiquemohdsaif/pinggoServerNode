@@ -1,8 +1,9 @@
 const { randomUUID, createHash } = require("crypto");
-const { getUserSocket } = require("./connectionManager");
+const { getUserSocket, isUserViewingChat } = require("./connectionManager");
 const { saveCallMessage } = require("./messageHandler");
 const { saveCallLog } = require("../models/CallLogStore");
 const { isBlockedBy } = require("../utils/blockUtils");
+const { sendCallNotification, sendCallCancelledNotification } = require("./fcmService");
 
 const calls = new Map();
 const callEndedListeners = new Set();
@@ -70,6 +71,12 @@ async function handleCallEvent(ws, payload, sendJson) {
     + ` length=${string(payload.sdp.description).length} hash=${sdpHash(payload.sdp.description)}`
     + ` hasBase64=${Boolean(payload.sdp.descriptionBase64)} time=${Date.now()}`);
   updateState(call, payload.type, string(payload.reason));
+  if (payload.type === "call_answer") {
+    console.log(`[call-connection] phase=signaling_connected callId=${callId}`
+      + ` chatId=${call.chatId} caller=${call.callerId} receiver=${call.receiverId}`
+      + ` mediaType=${call.mediaType} setupMs=${Math.max(0, call.connectedAt - call.createdAt)}`
+      + ` serverTime=${call.connectedAt}`);
+  }
   console.log(`[call] accepted type=${payload.type} callId=${callId} stateAfter=${call.state}`
     + ` receiver=${expectedReceiver} time=${Date.now()}`);
   const event = {
@@ -82,12 +89,23 @@ async function handleCallEvent(ws, payload, sendJson) {
     serverTime: Date.now(),
   };
   const receiverSocket = getUserSocket(expectedReceiver);
-  if (receiverSocket) sendJson(receiverSocket, event);
+  if (receiverSocket) {
+    sendJson(receiverSocket, event);
+    if (payload.type !== "ice_candidate") {
+      console.log(`[call-connection] phase=relay callId=${callId} type=${payload.type}`
+        + ` from=${ws.userId} to=${expectedReceiver} delivered=true serverTime=${Date.now()}`);
+    }
+  } else if (payload.type !== "ice_candidate") {
+    console.log(`[call-connection] phase=relay callId=${callId} type=${payload.type}`
+      + ` from=${ws.userId} to=${expectedReceiver} delivered=false serverTime=${Date.now()}`);
+  }
   if (payload.type === "call_answer") flushPendingCandidates(call, sendJson);
   sendJson(ws, { type: `${payload.type}_ack`, callId, state: call.state, serverTime: Date.now() });
   if (payload.type === "call_end" || payload.type === "call_reject" || payload.type === "call_busy") {
     notifyCallEnded(call);
     await finalizeCallMessage(call, sendJson);
+    await updateEndedCallNotification(call,
+      !call.connectedAt && ws.userId === call.callerId);
     setTimeout(() => calls.delete(callId), 30000);
   }
   return true;
@@ -165,9 +183,16 @@ async function handleInvite(ws, payload, sendJson) {
     connectedAt: null, endedAt: null, terminationReason: null,
     updatedAt: Date.now(), pendingCandidates: [] };
   calls.set(callId, call);
+  console.log(`[call-connection] phase=invite_created callId=${callId} chatId=${chatId}`
+    + ` caller=${call.callerId} receiver=${call.receiverId} mediaType=${mediaType}`
+    + ` receiverOnline=${Boolean(receiverSocket)} serverTime=${call.createdAt}`);
   console.log(`[call] created callId=${callId} state=${call.state} receiverOnline=${Boolean(receiverSocket)}`
     + ` time=${Date.now()}`);
   if (receiverSocket) sendInvite(call, receiverSocket, sendJson);
+  if (!isUserViewingChat(receiverId, chatId)) {
+    sendCallNotification({ receiverId, call }).catch((error) =>
+      console.error("Could not send incoming-call notification:", error.message));
+  }
   sendJson(ws, { type: "call_invite_ack", callId, receiverId, state: call.state, serverTime: Date.now() });
   scheduleCallingTimeout(callId, sendJson);
   return true;
@@ -219,6 +244,8 @@ async function handleCallDisconnect(userId, sendJson) {
         reason: "signaling_disconnected", serverTime: Date.now(),
       });
       await finalizeCallMessage(call, sendJson);
+      await updateEndedCallNotification(call,
+        !call.connectedAt && disconnectedUserId === call.callerId);
       notifyCallEnded(call);
       setTimeout(() => calls.delete(call.callId), 30000);
     }, SIGNALING_RECONNECT_GRACE_MS);
@@ -269,6 +296,7 @@ function scheduleCallingTimeout(callId, sendJson) {
       reason: "no_answer", serverTime: Date.now(),
     });
     await finalizeCallMessage(call, sendJson);
+    await updateEndedCallNotification(call, true);
     notifyCallEnded(call);
     setTimeout(() => calls.delete(callId), 30000);
   }, CALLING_TIMEOUT_MS);
@@ -330,21 +358,21 @@ async function finalizeCallMessage(call, sendJson) {
   const callerText = call.connectedAt ? text : `[${label}] didn't connect`;
   const receiverText = call.connectedAt ? text : `[${label}] missed`;
   try {
-    await saveCallLog(call);
-  } catch (error) {
-    console.error("Could not save call log:", error.message);
-  }
-  try {
-    await saveCallMessage({ callId: call.callId, chatId: call.chatId,
+    const savedMessage = await saveCallMessage({ callId: call.callId, chatId: call.chatId,
       callerId: call.callerId, receiverId: call.receiverId, mediaType: call.mediaType,
       text, callerText, receiverText, durationSeconds,
       createdAt: call.createdAt, ringingAt: call.ringingAt,
       connectedAt: call.connectedAt, endedAt: call.endedAt,
       terminationReason: call.terminationReason || "unknown",
       suppressedForReceiver: Boolean(call.suppressedForReceiver) }, sendJson);
+    const savedLog = await saveCallLog({ ...call, messageId: savedMessage.id });
+    for (const userId of [call.callerId, call.receiverId]) {
+      const socket = getUserSocket(userId);
+      if (socket) sendJson(socket, { type: "calls_list_updated", call: savedLog });
+    }
   } catch (error) {
     call.messageSaved = false;
-    console.error("Could not save voice call message:", error.message);
+    console.error("Could not save call message/log:", error.message);
   }
 }
 function formatDuration(totalSeconds) {
@@ -391,6 +419,23 @@ function notifyCallEnded(call) {
   call.mediaEndedNotified = true;
   for (const listener of callEndedListeners) {
     try { listener(call.callId); } catch (_error) {}
+  }
+}
+
+async function updateEndedCallNotification(call, showMissed) {
+  if (!call) return;
+  try {
+    if (showMissed && !call.connectedAt && !call.suppressedForReceiver
+        && !isUserViewingChat(call.receiverId, call.chatId)) {
+      // Reusing callId replaces the ringing card with the missed-call card.
+      await sendCallNotification({ receiverId: call.receiverId, call, missed: true });
+    } else {
+      // Declines and completed calls must only remove a stale ringing card.
+      await sendCallCancelledNotification({ receiverId: call.receiverId,
+        callId: call.callId });
+    }
+  } catch (error) {
+    console.error("Could not update ended call notification:", error.message);
   }
 }
 function account(value) { return string(value).replace(/^<plus>/, "").replace(/^\+/, ""); }

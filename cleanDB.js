@@ -4,12 +4,13 @@ const firestoreManager = FirestoreManager.getInstance();
 
 // Keep this list synchronized with the collections used by routes/, realtime/, models/, and utils/.
 // Chats contains every message type (0..11), including voice_call and video_call timeline messages.
-// CallLogs contains the per-user detailed call history written by models/CallLogStore.js.
+// CallsList contains each user's latest call per chat; CallLogs contains history by chatId.
 // ChatAttachments contains metadata only; this script does not delete uploaded files from disk/storage.
 // AppConfiguration is intentionally preserved because the server requires it after a database reset.
 const COLLECTIONS_TO_CLEAN = [
     "ChatAttachments",
     "CallLogs",
+    "CallsList",
     "Reports",
     "UserBlocks",
     "Chats",

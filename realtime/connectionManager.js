@@ -9,7 +9,21 @@ function addUser(userId, ws) {
 
   ws.userId = userId;
   ws.isAuthenticated = true;
+  ws.activeChatId = "";
   onlineUsers.set(userId, ws);
+}
+
+function setActiveChat(userId, ws, chatId) {
+  const currentSocket = getUserSocket(userId);
+  if (!currentSocket || currentSocket !== ws) return false;
+  currentSocket.activeChatId = normalizeString(chatId);
+  return true;
+}
+
+function isUserViewingChat(userId, chatId) {
+  const socket = getUserSocket(userId);
+  const normalizedChatId = normalizeString(chatId);
+  return Boolean(socket && normalizedChatId && socket.activeChatId === normalizedChatId);
 }
 
 function removeUser(userId, ws) {
@@ -45,7 +59,13 @@ module.exports = {
   getUserSocket,
   isUserOnline,
   getOnlineUserCount,
+  setActiveChat,
+  isUserViewingChat,
 };
+
+function normalizeString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
 
 function normalizeAccountId(value) {
   const normalized = typeof value === "string" ? value.trim() : "";
