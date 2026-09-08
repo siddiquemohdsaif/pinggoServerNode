@@ -23,21 +23,21 @@ function publicGroup(group) {
   return { ...withoutId(group), members: Object.values(group.members || {}) };
 }
 async function readGroup(groupId) {
-  try { return await firestore.readDocument("Groups", text(groupId), "/"); }
+  try { return await firestore.readDocument("GroupsList", text(groupId), "/"); }
   catch (_error) { return null; }
 }
 async function writeGroup(group) {
   const stored = withoutId(group);
-  try { return await firestore.updateDocument("Groups", group.groupId, "/", stored); }
-  catch (_error) { return firestore.createDocument("Groups", group.groupId, "/", stored); }
+  try { return await firestore.updateDocument("GroupsList", group.groupId, "/", stored); }
+  catch (_error) { return firestore.createDocument("GroupsList", group.groupId, "/", stored); }
 }
 async function readChat(groupId) {
-  try { return await firestore.readDocument("Chats", groupId, "/"); }
+  try { return await firestore.readDocument("GroupsChat", groupId, "/"); }
   catch (_error) { return null; }
 }
 async function ensureChat(groupId) {
   if (await readChat(groupId)) return;
-  try { await firestore.createDocument("Chats", groupId, "/", {}); } catch (_error) {}
+  try { await firestore.createDocument("GroupsChat", groupId, "/", {}); } catch (_error) {}
 }
 function defaultChatSettings(group) {
   return { pinned: false, notification_muted: "0", archieved: false, unread_count: 0,
@@ -83,7 +83,7 @@ async function systemMessage(group, actorId, event, targetIds = [], metadata = {
     senderId: accountId(actorId), messageType: "group_system", text: "", sentTime,
     status: "sent", systemEvent: { event, actorId: accountId(actorId), targetIds, ...metadata },
     receipts: {} };
-  await firestore.updateDocument("Chats", group.groupId, "/", { [message.id]: forStorage(message) });
+  await firestore.updateDocument("GroupsChat", group.groupId, "/", { [message.id]: forStorage(message) });
   await fanOutMessage(group, message, actorId);
   return message;
 }
@@ -157,6 +157,7 @@ async function changeMembers(groupId, actorId, memberIds, action) {
   else await Promise.all(ids.map((id) => removeFromChatList(id, groupId)));
   await systemMessage(group, actorId, action === "add" ? "members_added" : "members_removed", ids);
   ids.forEach((id) => send(id, { type: action === "add" ? "group_added" : "group_removed", groupId,
+    affectedUserId: id,
     group: action === "add" ? publicGroup(group) : undefined }));
   broadcast(group, { type: "group_updated", group: publicGroup(group) });
   return group;
@@ -174,8 +175,12 @@ async function leaveGroup(groupId, userId) {
   }
   group.updatedAt = now; group.membershipVersion = (group.membershipVersion || 0) + 1;
   await writeGroup(group); await removeFromChatList(id, groupId);
-  await systemMessage(group, id, "member_left", [id]);
-  send(id, { type: "group_left", groupId });
+  const leaveMessage = await systemMessage(group, id, "member_left", [id]);
+  // The normal fan-out contains active members only. Deliver the final system pill explicitly
+  // so the member who just left sees the same event in the still-open conversation.
+  send(id, { type: "new_group_message", message: leaveMessage, groupName: group.name,
+    groupIcon: group.icon || null });
+  send(id, { type: "group_left", groupId, affectedUserId: id });
   broadcast(group, { type: "group_updated", group: publicGroup(group) });
   return group;
 }
@@ -227,7 +232,7 @@ async function sendGroupMessage(ws, payload, sendJson) {
     let attachment = payload.attachment || null;
     const attachmentId = text(payload.attachmentId);
     if (!attachment && attachmentId) {
-      try { attachment = await firestore.readDocument("ChatAttachments", attachmentId, "/"); }
+      try { attachment = await firestore.readDocument("GroupAttachments", attachmentId, "/"); }
       catch (_error) { attachment = null; }
       if (!attachment || attachment.chatId !== groupId || accountId(attachment.uploaderId) !== senderId ||
           attachment.status !== "pending" || attachment.kind !== messageType) {
@@ -244,11 +249,11 @@ async function sendGroupMessage(ws, payload, sendJson) {
     if (payload.repliedMessageId) message.repliedMessageId = text(payload.repliedMessageId);
     if (attachment) message.attachment = attachment;
     if (payload.location) message.location = payload.location;
-    await ensureChat(groupId); await firestore.updateDocument("Chats", groupId, "/", {
+    await ensureChat(groupId); await firestore.updateDocument("GroupsChat", groupId, "/", {
       [message.id]: forStorage(message),
     });
-    if (attachmentId) await firestore.updateDocument("ChatAttachments", attachmentId, "/", {
-      ...withoutId(await firestore.readDocument("ChatAttachments", attachmentId, "/")), status: "used",
+    if (attachmentId) await firestore.updateDocument("GroupAttachments", attachmentId, "/", {
+      ...withoutId(await firestore.readDocument("GroupAttachments", attachmentId, "/")), status: "used",
       messageId: message.id, usedAt: sentTime,
     });
     await fanOutMessage(group, message, senderId);
@@ -271,7 +276,7 @@ async function markGroupMessages(ws, payload, sendJson, state) {
       updates[id] = { ...message, receipts: { ...(message.receipts || {}), [userId]: receipt } };
     });
     if (!Object.keys(updates).length) throw new Error("No messages found.");
-    await firestore.updateDocument("Chats", groupId, "/", updates);
+    await firestore.updateDocument("GroupsChat", groupId, "/", updates);
     if (state === "read") await mutateChatList(userId, (list) => { if (list[groupId]) list[groupId].unread_count = 0; });
     const event = { type: state === "read" ? "group_message_seen" : "group_message_delivered",
       groupId, messageIds: Object.keys(updates), userId, at };

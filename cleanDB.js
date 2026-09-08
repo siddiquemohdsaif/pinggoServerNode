@@ -9,11 +9,14 @@ const firestoreManager = FirestoreManager.getInstance();
 // AppConfiguration is intentionally preserved because the server requires it after a database reset.
 const COLLECTIONS_TO_CLEAN = [
     "ChatAttachments",
+    "GroupAttachments",
     "CallLogs",
     "CallsList",
     "Reports",
     "UserBlocks",
     "Chats",
+    "GroupsChat",
+    "GroupsList",
     "ChatsList",
     "EmailOtp",
     "P-ID-MAP",

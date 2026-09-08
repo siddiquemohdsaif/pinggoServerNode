@@ -134,7 +134,7 @@ router.post("/:uploadId/complete", async (req, res, next) => {
     if (alreadyCompleted) {
       return res.status(200).json({ success: true, attachment: alreadyCompleted });
     }
-    const relativePath = `chat_attachments/${sanitize(manifest.chatId)}/${manifest.attachmentId}-${sanitize(manifest.fileName)}`;
+    const relativePath = `${manifest.chatId.startsWith("grp_") ? "group_attachments" : "chat_attachments"}/${sanitize(manifest.chatId)}/${manifest.attachmentId}-${sanitize(manifest.fileName)}`;
     finalPath = resolveUploadPath(relativePath);
     if (!finalPath) return res.status(400).json({ success: false, message: "Invalid attachment path." });
     await fs.mkdir(path.dirname(finalPath), { recursive: true });
@@ -172,7 +172,7 @@ router.post("/:uploadId/complete", async (req, res, next) => {
       completedTime: Date.now(),
       sha256: fileHash,
     };
-    await firestoreManager.createDocument("ChatAttachments", attachment.id, "/", { ...attachment });
+    await firestoreManager.createDocument(attachmentCollection(manifest.chatId), attachment.id, "/", { ...attachment });
     const sessionDir = getChunkSessionDir(manifest.uploadId);
     await fs.writeFile(path.join(sessionDir, "completed.json"), JSON.stringify(attachment));
     await Promise.all(Array.from({ length: manifest.totalChunks }, (_, index) =>
@@ -227,7 +227,7 @@ router.post("/", upload.single("file"), async (req, res, next) => {
     const attachmentId = crypto.randomUUID();
     savedFile = await saveFile({
       buffer: req.file.buffer,
-      requestedPath: `chat_attachments/${sanitize(chatId)}/${attachmentId}-${sanitize(req.file.originalname)}`,
+      requestedPath: `${chatId.startsWith("grp_") ? "group_attachments" : "chat_attachments"}/${sanitize(chatId)}/${attachmentId}-${sanitize(req.file.originalname)}`,
       originalName: req.file.originalname,
       mimeType: req.file.mimetype,
     });
@@ -245,7 +245,7 @@ router.post("/", upload.single("file"), async (req, res, next) => {
       createdTime: Date.now(),
       sha256: sha256(req.file.buffer),
     };
-    await firestoreManager.createDocument("ChatAttachments", attachmentId, "/", { ...attachment });
+    await firestoreManager.createDocument(attachmentCollection(chatId), attachmentId, "/", { ...attachment });
     return res.status(201).json({ success: true, attachment });
   } catch (error) {
     if (savedFile) await deleteFile(savedFile.fullPath).catch(() => null);
@@ -266,6 +266,10 @@ async function isChatParticipant(chatId, uid) {
     return Boolean(groupService.activeMember(group, uid));
   }
   return chatId.split("_").map(normalizeId).includes(uid);
+}
+
+function attachmentCollection(chatId) {
+  return String(chatId || "").startsWith("grp_") ? "GroupAttachments" : "ChatAttachments";
 }
 
 function normalizeId(value) {

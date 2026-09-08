@@ -196,7 +196,7 @@ router.post("/clear", async (req, res) => {
       });
     }
     if (Object.keys(updates).length > 0) {
-      await firestoreManager.updateDocument("Chats", chatId, "/", updates);
+      await firestoreManager.updateDocument(chatCollection(chatId), chatId, "/", updates);
     }
     await clearChatListPreview(phoneNumber, chatId);
     pushChatCleared(phoneNumber, chatId);
@@ -600,11 +600,15 @@ async function getChatsListByPhoneNumber(phoneNumber) {
 
 async function getSingleChatByChatId(chatId) {
   try {
-    const userDoc = await firestoreManager.readDocument("Chats", chatId, "/");
+    const userDoc = await firestoreManager.readDocument(chatCollection(chatId), chatId, "/");
     return userDoc ? chatForInternal(userDoc) : false;
   } catch (error) {
     return false;
   }
+}
+
+function chatCollection(chatId) {
+  return String(chatId || "").startsWith("grp_") ? "GroupsChat" : "Chats";
 }
 
 async function getUserByPhoneNumber(phoneNumber) {
@@ -812,13 +816,13 @@ async function getRecentMessageCache(chatList, cacheSize, accountId) {
   const chatIds = getChatIdsFromChatList(chatList);
   if (chatIds.length === 0) return {};
   try {
-    const chatsById = await firestoreManager.bulkReadDocuments(
-      "Chats",
-      "/",
-      chatIds,
-      {},
-      true,
-    );
+    const directIds = chatIds.filter((chatId) => !chatId.startsWith("grp_"));
+    const groupIds = chatIds.filter((chatId) => chatId.startsWith("grp_"));
+    const [directChats, groupChats] = await Promise.all([
+      directIds.length ? firestoreManager.bulkReadDocuments("Chats", "/", directIds, {}, true) : {},
+      groupIds.length ? firestoreManager.bulkReadDocuments("GroupsChat", "/", groupIds, {}, true) : {},
+    ]);
+    const chatsById = { ...directChats, ...groupChats };
     return Object.fromEntries(
       chatIds.map((chatId) => [
         chatId,
@@ -917,7 +921,7 @@ async function getOtherUserProfilesFromChatList(chatList, phoneNumber) {
   let groupsById = {};
   if (groupChatIds.length > 0) {
     try {
-      groupsById = await firestoreManager.bulkReadDocuments("Groups", "/", groupChatIds, {}, true);
+      groupsById = await firestoreManager.bulkReadDocuments("GroupsList", "/", groupChatIds, {}, true);
     } catch (error) {
       console.error("Unable to read group summaries:", error.message);
     }

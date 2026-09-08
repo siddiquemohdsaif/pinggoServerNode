@@ -19,7 +19,10 @@ router.post("/get", wrap(async (req) => { const group = await groupService.readG
   groupService.requireMember(group, actor(req)); return { group: groupService.publicGroup(group) }; }));
 router.post("/details", wrap(async (req) => {
   const group = await groupService.readGroup(req.body.groupId);
-  groupService.requireMember(group, actor(req));
+  const requesterId = actor(req);
+  const ownMembership = group && group.members && group.members[requesterId];
+  if (!group) { const error = new Error("Group not found."); error.statusCode = 404; throw error; }
+  if (!ownMembership) { const error = new Error("Group membership required."); error.statusCode = 403; throw error; }
   const members = Object.values(group.members || {}).filter((member) => member.status === "active");
   let users = [];
   try { users = await firestore.bulkReadDocuments("Users", "/", members.map((m) => m.userId), {}); }
@@ -30,7 +33,7 @@ router.post("/details", wrap(async (req) => {
     return [id, { serverProfileName: profile.name || profile.displayName || "",
       profilePhotoUrl: profile.profilePhotoUrl || null, about: profile.about || "" }];
   }));
-  return { group: { ...groupService.publicGroup(group), members: members.map((member) => ({
+  return { group: { ...groupService.publicGroup(group), ownMembership, members: members.map((member) => ({
     ...member, ...(profiles.get(member.userId) || { serverProfileName: "", profilePhotoUrl: null, about: "" }),
   })) } };
 }));

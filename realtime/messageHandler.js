@@ -95,7 +95,7 @@ async function handleSendMessage(ws, payload, sendJson) {
   let attachment = null;
   if (["image", "video", "audio", "file"].includes(messageType)) {
     try {
-      attachment = await firestoreManager.readDocument("ChatAttachments", attachmentId, "/");
+      attachment = await firestoreManager.readDocument(attachmentCollection(chatId), attachmentId, "/");
     } catch (_error) {
       attachment = null;
     }
@@ -159,7 +159,7 @@ async function handleSendMessage(ws, payload, sendJson) {
       const updatedAttachment = { ...attachment, status: "attached", messageId, attachedTime: sentTime };
       delete updatedAttachment._id;
       firestoreManager
-        .updateDocument("ChatAttachments", attachmentId, "/", updatedAttachment)
+        .updateDocument(attachmentCollection(chatId), attachmentId, "/", updatedAttachment)
         .catch(() => null);
     }
     const receiverSocket = getUserSocket(receiverId);
@@ -944,7 +944,7 @@ async function handleDeliveredMessage(ws, payload, sendJson) {
 }
 
 async function saveMessage(chatId, message) {
-  const result = await firestoreManager.updateDocument("Chats", chatId, "/", {
+  const result = await firestoreManager.updateDocument(chatCollection(chatId), chatId, "/", {
     [message.id]: forStorage(message),
   });
 
@@ -1032,7 +1032,7 @@ async function ensureChatReadyForMessage(chatId, senderId, receiverId, includeRe
 
 async function createChatDocument(chatId) {
   try {
-    await firestoreManager.createDocument("Chats", chatId, "/", {});
+    await firestoreManager.createDocument(chatCollection(chatId), chatId, "/", {});
   } catch (error) {
     await updateMessages(chatId, {});
   }
@@ -1160,7 +1160,7 @@ function withoutDocumentId(document) {
 
 async function getChat(chatId) {
   try {
-    const stored = (await firestoreManager.readDocument("Chats", chatId, "/")) || null;
+    const stored = (await firestoreManager.readDocument(chatCollection(chatId), chatId, "/")) || null;
     if (!stored) return null;
     return chatForInternal(stored);
   } catch (error) {
@@ -1181,7 +1181,7 @@ async function updateMessages(chatId, messages) {
     ([key, value]) => [key, forStorage(value)],
   ));
   const result = await firestoreManager.updateDocument(
-    "Chats",
+    chatCollection(chatId),
     chatId,
     "/",
     storedMessages,
@@ -1375,6 +1375,16 @@ function normalizeString(value) {
     return "";
   }
   return value.trim();
+}
+
+function chatCollection(chatId) {
+  return normalizeString(chatId).startsWith("grp_") ? "GroupsChat" : "Chats";
+}
+
+function attachmentCollection(chatId) {
+  return normalizeString(chatId).startsWith("grp_")
+    ? "GroupAttachments"
+    : "ChatAttachments";
 }
 
 function positiveInteger(value) {
