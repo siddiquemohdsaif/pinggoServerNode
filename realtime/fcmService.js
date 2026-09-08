@@ -3,7 +3,7 @@ const getFirebaseAdmin = require("../Firebase/firebaseAdmin");
 
 const firestoreManager = FirestoreManager.getInstance();
 
-async function sendOfflineMessageNotification({ receiverId, message }) {
+async function sendOfflineMessageNotification({ receiverId, message, group }) {
   if (await isNotificationMuted(receiverId, message.chatId)) {
     return {
       success: false,
@@ -37,6 +37,8 @@ async function sendOfflineMessageNotification({ receiverId, message }) {
       preview: notificationPreview(message, messageType),
       profilePhotoUrl: senderProfile.profilePhotoUrl,
       attachmentUrl,
+      groupName: group ? normalizeString(group.name) : "",
+      groupIcon: group ? normalizeString(group.icon) : "",
     },
     android: {
       priority: "high",

@@ -25,6 +25,7 @@ const calls = require("./routes/calls.js");
 const auth = require("./routes/auth");
 const files = require("./routes/files");
 const chatAttachments = require("./routes/chatAttachments");
+const groups = require("./routes/groups");
 const { maxFileSizeMb, uploadDir } = require("./utils/fileStorage");
 
 // app.use(express.json());
@@ -57,6 +58,7 @@ authorizedRoutes.use("/profile", profile);
 authorizedRoutes.use("/chats/attachments", chatAttachments);
 authorizedRoutes.use("/chats", chats);
 authorizedRoutes.use("/calls", calls);
+authorizedRoutes.use("/groups", groups);
 
 app.use("/", authorizedRoutes); // Use the grouped routes
 

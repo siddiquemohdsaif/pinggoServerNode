@@ -18,6 +18,8 @@ const MESSAGE_TYPE_CODES = Object.freeze({
   text: 0, image: 1, video: 2, audio: 3, file: 4, location: 5,
   voice_call: 6, video_call: 7, report: 8, chat_report: 9,
   chat_block: 10, chat_unblock: 11,
+  group_system: 12,
+  group_system: 12,
 });
 const MESSAGE_TYPES = Object.freeze(Object.fromEntries(
   Object.entries(MESSAGE_TYPE_CODES).map(([name, code]) => [code, name]),
@@ -87,7 +89,11 @@ function forStorage(message) {
 function forClient(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) return message;
   if (!Object.prototype.hasOwnProperty.call(message, "t")) {
-    return { ...message, messageType: decodeMessageType(message.messageType) };
+    const messageType = Number.isInteger(message.messageType)
+      ? decodeMessageType(message.messageType)
+      : clean(message.messageType);
+    encodeMessageType(messageType);
+    return { ...message, messageType };
   }
   const expanded = {
     id: message.id, clientMessageId: message.cid ?? null, chatId: message.c,

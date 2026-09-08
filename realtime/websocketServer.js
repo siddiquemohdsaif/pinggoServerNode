@@ -30,6 +30,7 @@ const {
   deliverPendingCallsForUser,
   handleCallDisconnect,
 } = require("./callHandler");
+const { sendGroupMessage, markGroupMessages } = require("../services/groupService");
 
 function createWebSocketServer() {
   const wss = new WebSocketServer({ noServer: true });
@@ -107,6 +108,17 @@ async function handleMessage(ws, rawMessage) {
 
   if (message.type === "send_message") {
     await handleSendMessage(ws, message, sendJson);
+    return;
+  }
+
+  if (message.type === "send_group_message") {
+    await sendGroupMessage(ws, message, sendJson);
+    return;
+  }
+
+  if (message.type === "group_message_delivered" || message.type === "group_message_seen") {
+    await markGroupMessages(ws, message, sendJson,
+      message.type === "group_message_seen" ? "read" : "delivered");
     return;
   }
 

@@ -5,6 +5,7 @@ const path = require("path");
 const fs = require("fs").promises;
 const AES = require("../utils/AES_256");
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const groupService = require("../services/groupService");
 const { deleteFile, maxFileSizeMb, resolveUploadPath, saveFile, uploadDir } = require("../utils/fileStorage");
 
 const router = express.Router();
@@ -43,7 +44,7 @@ router.post("/init", async (req, res, next) => {
     if (req.body.fileHash && !fileHash) {
       return res.status(400).json({ success: false, message: "fileHash must be a SHA-256 value." });
     }
-    const error = validateChunkInit({ chatId, uploaderId, kind, mimeType, totalSize, totalChunks });
+    const error = await validateChunkInit({ chatId, uploaderId, kind, mimeType, totalSize, totalChunks });
     if (error) return res.status(error.status || 400).json({ success: false, message: error.message });
 
     const uploadId = crypto.randomUUID();
@@ -204,7 +205,7 @@ router.post("/", upload.single("file"), async (req, res, next) => {
     const chatId = String(req.body.chatId || "").trim();
     const kind = String(req.body.kind || "").trim().toLowerCase();
     if (!req.file) return res.status(400).json({ success: false, message: "Upload field 'file' is required." });
-    if (!chatId || !isChatParticipant(chatId, uploaderId)) {
+    if (!chatId || !(await isChatParticipant(chatId, uploaderId))) {
       return res.status(403).json({ success: false, message: "You are not a participant in this chat." });
     }
     if (!KINDS.has(kind)) {
@@ -259,7 +260,11 @@ function makeDownloadUrl(req, publicPath) {
   return `${base}${publicPath}`;
 }
 
-function isChatParticipant(chatId, uid) {
+async function isChatParticipant(chatId, uid) {
+  if (String(chatId).startsWith("grp_")) {
+    const group = await groupService.readGroup(chatId);
+    return Boolean(groupService.activeMember(group, uid));
+  }
   return chatId.split("_").map(normalizeId).includes(uid);
 }
 
@@ -327,8 +332,8 @@ function matchesDeclaredContent(buffer, kind, mimeType) {
   return mimeType.startsWith("image/");
 }
 
-function validateChunkInit({ chatId, uploaderId, kind, mimeType, totalSize, totalChunks }) {
-  if (!chatId || !isChatParticipant(chatId, uploaderId)) return statusError(403, "You are not a participant in this chat.");
+async function validateChunkInit({ chatId, uploaderId, kind, mimeType, totalSize, totalChunks }) {
+  if (!chatId || !(await isChatParticipant(chatId, uploaderId))) return statusError(403, "You are not a participant in this chat.");
   if (!KINDS.has(kind)) return statusError(400, "kind must be image, video, audio, or file.");
   if (kind === "image" && !mimeType.startsWith("image/")) return statusError(400, "Selected file is not an image.");
   if (kind === "video" && !mimeType.startsWith("video/")) return statusError(400, "Selected file is not a video.");

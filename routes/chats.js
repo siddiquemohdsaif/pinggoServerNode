@@ -6,6 +6,7 @@ const { chatForClient, chatForInternal, forStorage } = require("../utils/message
 const { reportForStorage, reportForInternal } = require("../utils/specializedRecords");
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
+const groupService = require("../services/groupService");
 
 router.post("/list", async (req, res) => {
   const routeStartedAt = process.hrtime.bigint();
@@ -78,20 +79,30 @@ router.post("/getChat", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Chat Id missing" });
     }
-    if (!chatId.split("_").map(normalizePhoneNumberForChatId).includes(phoneNumber)) {
-      return res.status(403).json({
-        success: false,
-        message: "phoneNumber must be a participant in chatId.",
-      });
+    const groupChat = chatId.startsWith("grp_");
+    let group = null;
+    if (groupChat) {
+      group = await groupService.readGroup(chatId);
+      try { groupService.requireMember(group, phoneNumber); }
+      catch (error) {
+        return res.status(error.statusCode || 403).json({ success: false, message: error.message });
+      }
+    } else if (!chatId.split("_").map(normalizePhoneNumberForChatId).includes(phoneNumber)) {
+      return res.status(403).json({ success: false,
+        message: "phoneNumber must be a participant in chatId." });
     }
 
     const chatDoc = await getSingleChatByChatId(chatId);
 
     if (chatDoc) {
-      const userProfile = await getOtherUserProfileFromChatId(
-        chatId,
-        phoneNumber,
-      );
+      const userProfile = groupChat ? {
+        chatId, chatType: "group", groupId: chatId, groupName: group.name,
+        groupDescription: group.description || "", groupIcon: group.icon || null,
+        groupMemberCount: Object.values(group.members || {}).filter(
+          (member) => member && member.status === "active").length,
+        ownGroupRole: group.members[normalizePhoneNumberForChatId(phoneNumber)].role,
+        membershipVersion: Number(group.membershipVersion) || 0,
+      } : await getOtherUserProfileFromChatId(chatId, phoneNumber);
 
       if (paginated) {
         const page = paginateChatMessages(chatDoc, chatId, pageSize, cursor, phoneNumber);
@@ -127,14 +138,49 @@ router.post("/getChat", async (req, res) => {
   }
 });
 
+router.post("/media", async (req, res) => {
+  try {
+    const phoneNumber = normalizePhoneNumber(req.body.phoneNumber || req.body.phone);
+    const chatId = normalizeString(req.body.chatId);
+    const pageSize = Math.min(50, Math.max(1, Number(req.body.pageSize) || 20));
+    const before = Number(req.body.before || Number.MAX_SAFE_INTEGER);
+    const phoneError = validatePhoneNumber({ phoneNumber });
+    if (phoneError || !chatId) return res.status(400).json({ success: false,
+      message: phoneError || "chatId is required." });
+    if (chatId.startsWith("grp_")) {
+      const group = await groupService.readGroup(chatId);
+      try { groupService.requireMember(group, phoneNumber); }
+      catch (error) { return res.status(error.statusCode || 403).json({ success: false, message: error.message }); }
+    } else if (!chatId.split("_").map(normalizePhoneNumberForChatId).includes(phoneNumber)) {
+      return res.status(403).json({ success: false, message: "Chat participation required." });
+    }
+    const chat = await getSingleChatByChatId(chatId);
+    if (!chat) return res.status(404).json({ success: false, message: "Chat not found." });
+    const media = getPageableMessagesFromChatDocument(chat, chatId, phoneNumber)
+      .filter((message) => {
+        const type = normalizeString(message.messageType).toLowerCase();
+        const hasSupportedAttachment = message.attachment && ["image", "video", "file"].includes(type);
+        const hasLink = /https?:\/\/[^\s]+/i.test(normalizeString(message.text));
+        return (hasSupportedAttachment || hasLink) && Number(message.sentTime) < before;
+      })
+      .sort(compareMessageSortEntries).slice(0, pageSize);
+    return res.status(200).json({ success: true, media: media.map(forStorage),
+      nextCursor: media.length === pageSize ? media[media.length - 1].sentTime : null,
+      hasMore: media.length === pageSize });
+  } catch (error) { return res.status(400).json({ success: false, message: error.message }); }
+});
+
 router.post("/clear", async (req, res) => {
   try {
     const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
     );
     const chatId = normalizeString(req.body.chatId);
-    const validationError = validatePhoneNumber({ phoneNumber }) ||
-      validateChatParticipant(phoneNumber, chatId);
+    let validationError = validatePhoneNumber({ phoneNumber });
+    if (!validationError && chatId.startsWith("grp_")) {
+      try { groupService.requireMember(await groupService.readGroup(chatId), phoneNumber); }
+      catch (error) { validationError = error.message; }
+    } else if (!validationError) validationError = validateChatParticipant(phoneNumber, chatId);
     if (validationError) {
       return res.status(400).json({ success: false, message: validationError });
     }
@@ -821,7 +867,9 @@ async function getOtherUserProfileFromChatId(chatId, phoneNumber) {
 
 async function getOtherUserProfilesFromChatList(chatList, phoneNumber) {
   const chatIds = getChatIdsFromChatList(chatList);
-  const chatContacts = chatIds.map((chatId) => ({
+  const groupChatIds = chatIds.filter((chatId) => chatId.startsWith("grp_"));
+  const directChatIds = chatIds.filter((chatId) => !chatId.startsWith("grp_"));
+  const chatContacts = directChatIds.map((chatId) => ({
     chatId,
     phoneNumber: getOtherPhoneNumberFromChatId(chatId, phoneNumber),
   }));
@@ -851,7 +899,7 @@ async function getOtherUserProfilesFromChatList(chatList, phoneNumber) {
     }),
   );
 
-  return chatContacts.map(({ chatId, phoneNumber: contactPhoneNumber }) => {
+  const directProfiles = chatContacts.map(({ chatId, phoneNumber: contactPhoneNumber }) => {
     const user = usersByPhoneNumber.get(contactPhoneNumber);
     const profileData = user && user.profileData ? user.profileData : {};
     const chatSettings = getChatSettings(chatList, chatId);
@@ -866,6 +914,34 @@ async function getOtherUserProfilesFromChatList(chatList, phoneNumber) {
       ...chatSettings,
     };
   });
+  let groupsById = {};
+  if (groupChatIds.length > 0) {
+    try {
+      groupsById = await firestoreManager.bulkReadDocuments("Groups", "/", groupChatIds, {}, true);
+    } catch (error) {
+      console.error("Unable to read group summaries:", error.message);
+    }
+  }
+  const ownId = normalizePhoneNumberForChatId(phoneNumber);
+  const groupProfiles = groupChatIds.map((chatId) => {
+    const group = groupsById[chatId] || {};
+    const memberMap = group.members && typeof group.members === "object" ? group.members : {};
+    const activeMembers = Object.values(memberMap).filter((member) => member && member.status === "active");
+    return {
+      chatId,
+      chatType: "group",
+      groupId: chatId,
+      groupName: group.name || getChatSettings(chatList, chatId).group_name || "Group",
+      groupDescription: group.description || "",
+      groupIcon: group.icon || getChatSettings(chatList, chatId).group_icon || null,
+      groupMemberCount: activeMembers.length,
+      ownGroupRole: memberMap[ownId] && memberMap[ownId].role || "member",
+      membershipVersion: Number(group.membershipVersion) || 0,
+      ...getChatSettings(chatList, chatId),
+    };
+  });
+  const profilesById = new Map([...directProfiles, ...groupProfiles].map((profile) => [profile.chatId, profile]));
+  return chatIds.map((chatId) => profilesById.get(chatId)).filter(Boolean);
 }
 
 function getChatSettings(chatList, chatId) {
@@ -1023,6 +1099,7 @@ async function getUserProfileSummary(phoneNumber) {
     phoneNumber:
       normalizePhoneNumberForChatId(profileData.phoneNumber) ||
       normalizedPhoneNumber,
+    serverProfileName: profileData.name || profileData.displayName || "",
     profilePhotoUrl: profileData.profilePhotoUrl || null,
     isOnline: userDoc.isOnline || false,
     lastSeen: userDoc.lastSeen || Date.now(),
