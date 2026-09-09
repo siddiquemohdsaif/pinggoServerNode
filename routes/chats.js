@@ -2,11 +2,12 @@ const express = require("express");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { getUserSocket } = require("../realtime/connectionManager");
 const { isBlockedBy, setBlocked } = require("../utils/blockUtils");
-const { chatForClient, chatForInternal, forStorage } = require("../utils/messageTypes");
+const { chatForInternal, forStorage } = require("../utils/messageTypes");
 const { reportForStorage, reportForInternal } = require("../utils/specializedRecords");
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
 const groupService = require("../services/groupService");
+const { readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 
 router.post("/list", async (req, res) => {
   const routeStartedAt = process.hrtime.bigint();
@@ -70,9 +71,8 @@ router.post("/getChat", async (req, res) => {
     }
 
     const chatId = req.body.chatId;
-    const paginated = req.body.pageSize !== undefined || req.body.cursor !== undefined;
     const pageSize = normalizePageSize(req.body.pageSize);
-    const cursor = paginated ? decodeMessageCursor(req.body.cursor) : null;
+    const cursor = decodeMessageCursor(req.body.cursor);
 
     if (!chatId) {
       return res
@@ -92,7 +92,13 @@ router.post("/getChat", async (req, res) => {
         message: "phoneNumber must be a participant in chatId." });
     }
 
-    const chatDoc = await getSingleChatByChatId(chatId);
+    let chatDoc = await getSingleChatByChatId(chatId);
+
+    if (groupChat && chatDoc) {
+      const membership = group.members[normalizePhoneNumberForChatId(phoneNumber)];
+      chatDoc = Object.fromEntries(Object.entries(chatDoc).filter(([, message]) =>
+        message && groupService.memberCanAccessMessage(membership, phoneNumber, message)));
+    }
 
     if (chatDoc) {
       const userProfile = groupChat ? {
@@ -104,29 +110,20 @@ router.post("/getChat", async (req, res) => {
         membershipVersion: Number(group.membershipVersion) || 0,
       } : await getOtherUserProfileFromChatId(chatId, phoneNumber);
 
-      if (paginated) {
-        const page = paginateChatMessages(chatDoc, chatId, pageSize, cursor, phoneNumber);
-        const pinnedMessages = cursor ? [] : getPinnedChatMessages(chatDoc, chatId, phoneNumber);
-        return res.status(200).json({
-          success: true,
-          pinnedMessages: pinnedMessages.map(forStorage),
-          messages: page.messages.map(forStorage),
-          replyMessages: getReplyMessagesForPage(
-            chatDoc,
-            chatId,
-            [...page.messages, ...pinnedMessages],
-            phoneNumber,
-          ).map(forStorage),
-          nextCursor: page.nextCursor,
-          hasMore: page.hasMore,
-          userProfile,
-        });
-      }
-
-      // Keep the old response available to clients that do not request pagination.
+      const page = paginateChatMessages(chatDoc, chatId, pageSize, cursor, phoneNumber);
+      const pinnedMessages = cursor ? [] : getPinnedChatMessages(chatDoc, chatId, phoneNumber);
       return res.status(200).json({
         success: true,
-        chat: chatForClient(chatForParticipant(chatDoc, phoneNumber)),
+        pinnedMessages: pinnedMessages.map(forStorage),
+        messages: page.messages.map(forStorage),
+        replyMessages: getReplyMessagesForPage(
+          chatDoc,
+          chatId,
+          [...page.messages, ...pinnedMessages],
+          phoneNumber,
+        ).map(forStorage),
+        nextCursor: page.nextCursor,
+        hasMore: page.hasMore,
         userProfile,
       });
     }
@@ -196,7 +193,7 @@ router.post("/clear", async (req, res) => {
       });
     }
     if (Object.keys(updates).length > 0) {
-      await firestoreManager.updateDocument(chatCollection(chatId), chatId, "/", updates);
+      await upsertShardedEntries(chatCollection(chatId), chatId, updates);
     }
     await clearChatListPreview(phoneNumber, chatId);
     pushChatCleared(phoneNumber, chatId);
@@ -239,7 +236,7 @@ router.post("/report", async (req, res) => {
       status: "sent",
       invisible: [],
     };
-    await firestoreManager.updateDocument("Chats", chatId, "/", {
+    await upsertShardedEntries("Chats", chatId, {
       [messageId]: forStorage(message),
     });
 
@@ -308,7 +305,7 @@ async function changeBlockState(req, res, blocked) {
         messageType: blocked ? "chat_block" : "chat_unblock",
         text: `${phoneNumber} ${action} ${opponentId}`,
         sentTime: updatedAt, status: "sent", invisible: [] };
-      await firestoreManager.updateDocument("Chats", chatId, "/", {
+      await upsertShardedEntries("Chats", chatId, {
         [messageId]: forStorage(message),
       });
       await Promise.all([
@@ -600,7 +597,7 @@ async function getChatsListByPhoneNumber(phoneNumber) {
 
 async function getSingleChatByChatId(chatId) {
   try {
-    const userDoc = await firestoreManager.readDocument(chatCollection(chatId), chatId, "/");
+    const userDoc = await readShardedMap(chatCollection(chatId), chatId);
     return userDoc ? chatForInternal(userDoc) : false;
   } catch (error) {
     return false;
@@ -752,16 +749,6 @@ function callTextForParticipant(message, accountId) {
     : (message.receiverText || message.text);
 }
 
-function chatForParticipant(chat, accountId) {
-  if (!chat || typeof chat !== "object") return chat;
-  return Object.fromEntries(Object.entries(chat).map(([key, value]) => [
-    key,
-    key === "_id" || !value || typeof value !== "object"
-      ? value
-      : { ...value, text: callTextForParticipant(value, accountId) },
-  ]));
-}
-
 function compareMessageSortEntries(first, second) {
   if (first.sentTime !== second.sentTime) return second.sentTime - first.sentTime;
   return second.id.localeCompare(first.id);
@@ -816,17 +803,14 @@ async function getRecentMessageCache(chatList, cacheSize, accountId) {
   const chatIds = getChatIdsFromChatList(chatList);
   if (chatIds.length === 0) return {};
   try {
-    const directIds = chatIds.filter((chatId) => !chatId.startsWith("grp_"));
-    const groupIds = chatIds.filter((chatId) => chatId.startsWith("grp_"));
-    const [directChats, groupChats] = await Promise.all([
-      directIds.length ? firestoreManager.bulkReadDocuments("Chats", "/", directIds, {}, true) : {},
-      groupIds.length ? firestoreManager.bulkReadDocuments("GroupsChat", "/", groupIds, {}, true) : {},
-    ]);
-    const chatsById = { ...directChats, ...groupChats };
+    const documents = await Promise.all(chatIds.map((chatId) => getSingleChatByChatId(chatId)));
+    const chatsById = Object.fromEntries(chatIds.map((chatId, index) =>
+      [chatId, documents[index]]));
     return Object.fromEntries(
       chatIds.map((chatId) => [
         chatId,
-        paginateChatMessages(chatForInternal(chatsById[chatId]), chatId,
+        chatId.startsWith("grp_") ? [] : paginateChatMessages(
+          chatForInternal(chatsById[chatId]), chatId,
           cacheSize, null, accountId).messages.map(forStorage),
       ]),
     );

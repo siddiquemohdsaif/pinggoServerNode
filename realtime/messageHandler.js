@@ -4,6 +4,8 @@ const { sendOfflineMessageNotification } = require("./fcmService");
 const { isBlockedBy } = require("../utils/blockUtils");
 const { decodeMessageType, forStorage, chatForInternal } = require("../utils/messageTypes");
 const { nextTimestamp } = require("../utils/timestampId");
+const { ensureShardedContainer, readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
+const { ensureAccountCollections } = require("../models/AccountStore");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -21,7 +23,7 @@ async function handleSendMessage(ws, payload, sendJson) {
     messageType = decodeMessageType(payload.messageType);
   } catch (_error) {
     sendMessageFailed(ws, sendJson, { clientMessageId, chatId,
-      message: "messageType must be an integer from 0 through 11." });
+      message: "messageType must be a recognized integer code from 0 through 12." });
     return;
   }
   const attachmentId = normalizeString(payload.attachmentId);
@@ -944,7 +946,7 @@ async function handleDeliveredMessage(ws, payload, sendJson) {
 }
 
 async function saveMessage(chatId, message) {
-  const result = await firestoreManager.updateDocument(chatCollection(chatId), chatId, "/", {
+  const result = await upsertShardedEntries(chatCollection(chatId), chatId, {
     [message.id]: forStorage(message),
   });
 
@@ -1025,17 +1027,22 @@ async function ensureChatReadyForMessage(chatId, senderId, receiverId, includeRe
     await createChatDocument(chatId);
   }
 
+  const accountIds = includeReceiver ? [senderId, receiverId] : [senderId];
+  await Promise.all(accountIds.map(ensureAccountCollections));
   const participants = [addChatIdToChatsList(senderId, chatId)];
   if (includeReceiver) participants.push(addChatIdToChatsList(receiverId, chatId));
   await Promise.all(participants);
 }
 
 async function createChatDocument(chatId) {
-  try {
-    await firestoreManager.createDocument(chatCollection(chatId), chatId, "/", {});
-  } catch (error) {
-    await updateMessages(chatId, {});
+  if (chatCollection(chatId) === "GroupsChat") {
+    await ensureShardedContainer("GroupsChat", chatId, "messages");
+    return;
   }
+  await Promise.all([
+    ensureShardedContainer("Chats", chatId, "messages"),
+    ensureShardedContainer("CallLogs", chatId, "calls"),
+  ]);
 }
 
 async function addChatIdToChatsList(userId, chatId) {
@@ -1160,7 +1167,7 @@ function withoutDocumentId(document) {
 
 async function getChat(chatId) {
   try {
-    const stored = (await firestoreManager.readDocument(chatCollection(chatId), chatId, "/")) || null;
+    const stored = await readShardedMap(chatCollection(chatId), chatId);
     if (!stored) return null;
     return chatForInternal(stored);
   } catch (error) {
@@ -1180,12 +1187,7 @@ async function updateMessages(chatId, messages) {
   const storedMessages = Object.fromEntries(Object.entries(messages || {}).map(
     ([key, value]) => [key, forStorage(value)],
   ));
-  const result = await firestoreManager.updateDocument(
-    chatCollection(chatId),
-    chatId,
-    "/",
-    storedMessages,
-  );
+  const result = await upsertShardedEntries(chatCollection(chatId), chatId, storedMessages);
   if (!result) {
     throw new Error("Messages could not be updated.");
   }

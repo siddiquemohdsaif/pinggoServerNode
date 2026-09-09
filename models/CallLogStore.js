@@ -1,5 +1,6 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { callLogForStorage, callLogForClient } = require("../utils/specializedRecords");
+const { readShardedMap, upsertShardedEntries } = require("./ShardedDocumentStore");
 
 const firestore = FirestoreManager.getInstance();
 const LIST_COLLECTION = "CallsList";
@@ -73,10 +74,9 @@ async function saveCallLog(call) {
   const log = buildLog(call);
   if (!log.chatId) throw new Error("chatId is required.");
   if (!log.callerId || !log.receiverId) throw new Error("Call participants are required.");
-  const existingLogs = await readDocumentOrNull(LOG_COLLECTION, log.chatId);
-  await upsertDocument(LOG_COLLECTION, log.chatId, {
-    ...withoutDocumentId(existingLogs), [log.callId]: callLogForStorage(log),
-  }, Boolean(existingLogs));
+  await upsertShardedEntries(LOG_COLLECTION, log.chatId, {
+    [log.callId]: callLogForStorage(log),
+  }, "calls");
   await Promise.all([
     updateCallsList(log.callerId, log.receiverId, log),
     updateCallsList(log.receiverId, log.callerId, log),
@@ -138,7 +138,7 @@ async function getCallLogs(userId, chatId, pageSize, cursor) {
     error.statusCode = 403;
     throw error;
   }
-  const document = await readDocumentOrNull(LOG_COLLECTION, normalizedChatId);
+  const document = await readShardedMap(LOG_COLLECTION, normalizedChatId, "calls");
   const values = Object.entries(document || {})
     .filter(([key, value]) => key !== "_id" && value && typeof value === "object")
     .map(([, value]) => callLogForClient(value))

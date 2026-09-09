@@ -10,6 +10,19 @@ const wrap = (handler) => async (req, res) => {
   try { const value = await handler(req); res.status(200).json({ success: true, ...value }); }
   catch (error) { res.status(error.statusCode || 400).json({ success: false, message: error.message }); }
 };
+const encodeMessageCursor = (message) => Buffer.from(JSON.stringify({
+  sentTime: Number(message.sentTime) || 0, messageId: String(message.id || ""),
+}), "utf8").toString("base64url");
+const decodeMessageCursor = (value) => {
+  if (!value) return null;
+  try {
+    const cursor = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8"));
+    if (!Number.isFinite(Number(cursor.sentTime)) || !cursor.messageId) throw new Error();
+    return { sentTime: Number(cursor.sentTime), messageId: String(cursor.messageId) };
+  } catch (_error) {
+    const error = new Error("cursor is invalid."); error.statusCode = 400; throw error;
+  }
+};
 
 router.post("/create", wrap(async (req) => ({ group: groupService.publicGroup(await groupService.createGroup({
   creatorId: actor(req), name: req.body.name, description: req.body.description, icon: req.body.icon,
@@ -38,12 +51,21 @@ router.post("/details", wrap(async (req) => {
   })) } };
 }));
 router.post("/messages", wrap(async (req) => { const group = await groupService.readGroup(req.body.groupId);
-  groupService.requireMember(group, actor(req)); const chat = await groupService.readChat(req.body.groupId);
-  const limit = Math.min(100, Math.max(1, Number(req.body.pageSize) || 50)); const before = Number(req.body.before || Infinity);
-  const messages = Object.values(chat || {}).filter((m) => m && m.id && Number(m.sentTime) < before)
-    .sort((a, b) => Number(b.sentTime) - Number(a.sentTime)).slice(0, limit);
-  return { messages, nextCursor: messages.length === limit ? messages[messages.length - 1].sentTime : null,
-    hasMore: messages.length === limit }; }));
+  const requesterId = actor(req); groupService.requireMember(group, requesterId);
+  const membership = group.members[requesterId]; const chat = await groupService.readChat(req.body.groupId);
+  const limit = Math.min(100, Math.max(1, Number(req.body.pageSize) || 50));
+  const cursor = decodeMessageCursor(req.body.cursor);
+  const all = Object.values(chat || {}).filter((m) => m && m.id
+      && Number.isFinite(Number(m.sentTime))
+      && groupService.memberCanAccessMessage(membership, requesterId, m))
+    .sort((a, b) => Number(b.sentTime) - Number(a.sentTime) || String(b.id).localeCompare(String(a.id)));
+  const eligible = all.filter((message) => cursor
+    ? Number(message.sentTime) < cursor.sentTime
+      || (Number(message.sentTime) === cursor.sentTime && String(message.id) < cursor.messageId)
+    : true);
+  const messages = eligible.slice(0, limit); const hasMore = eligible.length > messages.length;
+  return { messages, nextCursor: hasMore && messages.length
+    ? encodeMessageCursor(messages[messages.length - 1]) : null, hasMore }; }));
 router.post("/update", wrap(async (req) => ({ group: groupService.publicGroup(await groupService.updateGroup(
   req.body.groupId, actor(req), req.body,
 )) })));
@@ -57,7 +79,8 @@ router.post("/members/role", wrap(async (req) => ({ group: groupService.publicGr
   req.body.groupId, actor(req), req.body.memberId, req.body.role,
 )) })));
 router.post("/leave", wrap(async (req) => ({ groupId: req.body.groupId,
-  group: groupService.publicGroup(await groupService.leaveGroup(req.body.groupId, actor(req))) })));
+  group: groupService.publicGroup(await groupService.leaveGroup(
+    req.body.groupId, actor(req), req.body.successorAdminId)) })));
 router.post("/report", wrap(async (req) => {
   const reporterId = actor(req); const groupId = String(req.body.groupId || "").trim();
   const reason = String(req.body.reason || "").trim();
