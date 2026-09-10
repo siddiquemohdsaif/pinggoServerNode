@@ -1,5 +1,6 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const getFirebaseAdmin = require("../Firebase/firebaseAdmin");
+const { getFcmRegistration, getPrimaryFcmTokens } = require("../models/DeviceStore");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -11,8 +12,8 @@ async function sendOfflineMessageNotification({ receiverId, message, group }) {
       reason: "Chat notifications are muted.",
     };
   }
-  const fcmToken = await getFcmToken(receiverId);
-  if (!fcmToken) {
+  const fcmTokens = await getFcmTokens(receiverId);
+  if (fcmTokens.length === 0) {
     return {
       success: false,
       skipped: true,
@@ -25,8 +26,7 @@ async function sendOfflineMessageNotification({ receiverId, message, group }) {
   const attachmentUrl = messageType === "image" && message.attachment
     ? normalizeString(message.attachment.url)
     : "";
-  const providerMessageId = await getFirebaseAdmin().messaging().send({
-    token: fcmToken,
+  const providerMessageIds = await sendToTokens(fcmTokens, {
     data: {
       type: "new_message",
       chatId: normalizeString(message.chatId),
@@ -48,16 +48,15 @@ async function sendOfflineMessageNotification({ receiverId, message, group }) {
 
   return {
     success: true,
-    providerData: { messageId: providerMessageId },
+    providerData: { messageIds: providerMessageIds },
   };
 }
 
 async function sendCallNotification({ receiverId, call, missed = false }) {
-  const fcmToken = await getFcmToken(receiverId);
-  if (!fcmToken) return { success: false, skipped: true, reason: "Receiver FCM token is not available." };
+  const fcmTokens = await getFcmTokens(receiverId);
+  if (fcmTokens.length === 0) return { success: false, skipped: true, reason: "Receiver FCM token is not available." };
   const callerProfile = await getSenderProfile(call.callerId);
-  const providerMessageId = await getFirebaseAdmin().messaging().send({
-    token: fcmToken,
+  const providerMessageIds = await sendToTokens(fcmTokens, {
     data: {
       type: missed ? "call_missed" : "call_incoming",
       callId: normalizeString(call.callId),
@@ -69,21 +68,62 @@ async function sendCallNotification({ receiverId, call, missed = false }) {
     },
     android: { priority: "high", ttl: missed ? 24 * 60 * 60 * 1000 : 45 * 1000 },
   });
-  return { success: true, providerData: { messageId: providerMessageId } };
+  return { success: true, providerData: { messageIds: providerMessageIds } };
 }
 
 async function sendCallCancelledNotification({ receiverId, callId }) {
-  const fcmToken = await getFcmToken(receiverId);
-  if (!fcmToken) return { success: false, skipped: true, reason: "Receiver FCM token is not available." };
-  const providerMessageId = await getFirebaseAdmin().messaging().send({
-    token: fcmToken,
+  const fcmTokens = await getFcmTokens(receiverId);
+  if (fcmTokens.length === 0) return { success: false, skipped: true, reason: "Receiver FCM token is not available." };
+  const providerMessageIds = await sendToTokens(fcmTokens, {
     data: {
       type: "call_cancelled",
       callId: normalizeString(callId),
     },
     android: { priority: "high", ttl: 45 * 1000 },
   });
-  return { success: true, providerData: { messageId: providerMessageId } };
+  return { success: true, providerData: { messageIds: providerMessageIds } };
+}
+
+async function sendSessionLogoutNotification({ tokens, accountId, revokedAt, reason, message }) {
+  const targets = [...new Set((tokens || []).map(normalizeString).filter(Boolean))];
+  if (targets.length === 0) return { success: false, skipped: true };
+  const providerMessageIds = await sendToTokens(targets, {
+    data: {
+      type: "account_logout",
+      accountId: normalizeString(accountId),
+      revokedAt: String(Number(revokedAt) || Date.now()),
+      reason: normalizeString(reason) || "primary_logout",
+      message: normalizeString(message),
+    },
+    android: { priority: "high", ttl: 60 * 1000 },
+  });
+  return { success: true, providerData: { messageIds: providerMessageIds } };
+}
+
+async function sendDeviceActivityNotification({ accountId, event, device, actorDeviceId }) {
+  const tokens = await getPrimaryFcmTokens(accountId);
+  if (tokens.length === 0) return { success: false, skipped: true };
+  const data = deviceActivityData({ accountId, event, device, actorDeviceId });
+  const providerMessageIds = await sendToTokens(tokens, {
+    data,
+    android: { priority: "high", ttl: 24 * 60 * 60 * 1000 },
+  });
+  return { success: true, providerData: { messageIds: providerMessageIds } };
+}
+
+function deviceActivityData({ accountId, event, device, actorDeviceId }) {
+  const linked = event === "device_linked";
+  const target = device || {};
+  const deviceId = normalizeString(target.deviceId);
+  const actor = normalizeString(actorDeviceId);
+  return {
+    type: linked ? "device_linked" : "device_unlinked",
+    accountId: normalizeString(accountId),
+    deviceId,
+    deviceName: normalizeString(target.name) || "Companion device",
+    reason: linked ? "linked" : (actor && actor === deviceId ? "self_logout" : "detached"),
+    changedAt: String(Date.now()),
+  };
 }
 
 async function isNotificationMuted(receiverId, chatId) {
@@ -127,7 +167,7 @@ function notificationPreview(message, messageType) {
   return text.length > 500 ? text.substring(0, 500) : text;
 }
 
-async function getFcmToken(receiverId) {
+async function getLegacyFcmToken(receiverId) {
   try {
     const userDoc = await firestoreManager.readDocument("Users", receiverId, "/");
     if (!userDoc) {
@@ -145,6 +185,30 @@ async function getFcmToken(receiverId) {
   }
 }
 
+async function getFcmTokens(receiverId) {
+  const registration = await getFcmRegistration(receiverId)
+    .catch(() => ({ registryExists: false, tokens: [] }));
+  // Once an account has migrated to the device registry, an empty token set
+  // means every installation was revoked. Falling back would resurrect a stale
+  // legacy token and leak old-account notifications to a switched device.
+  if (registration.registryExists) return registration.tokens;
+  const legacy = await getLegacyFcmToken(receiverId);
+  return legacy ? [legacy] : [];
+}
+
+async function sendToTokens(tokens, message) {
+  const messaging = getFirebaseAdmin().messaging();
+  const results = await Promise.allSettled(tokens.map((token) =>
+    messaging.send({ ...message, token })));
+  const ids = results.filter((result) => result.status === "fulfilled")
+    .map((result) => result.value);
+  if (ids.length === 0) {
+    const failure = results.find((result) => result.status === "rejected");
+    throw (failure ? failure.reason : new Error("No notification target accepted the message."));
+  }
+  return ids;
+}
+
 function normalizeString(value) {
   if (typeof value !== "string") {
     return "";
@@ -156,4 +220,7 @@ module.exports = {
   sendOfflineMessageNotification,
   sendCallNotification,
   sendCallCancelledNotification,
+  sendSessionLogoutNotification,
+  sendDeviceActivityNotification,
+  deviceActivityData,
 };

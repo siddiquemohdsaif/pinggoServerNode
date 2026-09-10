@@ -2,6 +2,8 @@ const express = require("express");
 const uploadProfilePhoto = require("./uploadProfilePhoto");
 const { getPresenceForUsers } = require("../realtime/presenceService");
 const { updateProfileField } = require("../utils/profileUpdateUtils");
+const AES = require("../utils/AES_256");
+const { registerDevice } = require("../models/DeviceStore");
 
 const router = express.Router();
 
@@ -28,6 +30,24 @@ router.post("/updateEmail", async (req, res) => {
 });
 
 router.post("/updateFcmToken", async (req, res) => {
+  if (req.body.deviceId) {
+    try {
+      if (req.auth.deviceId && req.auth.deviceId !== req.body.deviceId) {
+        return res.status(403).json({ success: false, message: "Device credential mismatch." });
+      }
+      const device = await registerDevice(AES.getAuthUid(req), {
+        deviceId: req.body.deviceId,
+        name: req.body.deviceName,
+        platform: req.body.platform || "android",
+        appVersion: req.body.appVersion,
+        fcmToken: req.body.fcmToken || req.body.deviceToken || req.body.token,
+        role: req.auth.deviceId ? "companion" : "primary",
+      });
+      return res.status(200).json({ success: true, device });
+    } catch (error) {
+      return res.status(error.statusCode || 400).json({ success: false, message: error.message });
+    }
+  }
   return updateProfileField(
     req,
     res,

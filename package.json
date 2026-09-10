@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test test/*.test.js",
     "run": "node index.js",
     "migrate:sharded:dry-run": "node test/migrateShardedStorage.js",
     "migrate:sharded": "node test/migrateShardedStorage.js --execute"

@@ -1,6 +1,6 @@
 const crypto = require("crypto");
 const FirestoreManager = require("../Firestore/FirestoreManager");
-const { getUserSocket, isUserViewingChat } = require("../realtime/connectionManager");
+const { getUserSockets, isUserOnline, isUserViewingChat } = require("../realtime/connectionManager");
 const { nextTimestamp } = require("../utils/timestampId");
 const { forStorage } = require("../utils/messageTypes");
 const { sendOfflineMessageNotification } = require("../realtime/fcmService");
@@ -115,8 +115,9 @@ async function retainRemovedChat(userId, group, message) {
   });
 }
 function send(userId, payload) {
-  const socket = getUserSocket(accountId(userId));
-  if (socket && socket.readyState === 1) socket.send(JSON.stringify(payload));
+  getUserSockets(accountId(userId)).forEach((socket) => {
+    if (socket.readyState === 1) socket.send(JSON.stringify(payload));
+  });
 }
 function broadcast(group, payload, except) {
   Object.values(group.members || {}).filter((m) => m.status === "active" && m.userId !== except)
@@ -147,7 +148,7 @@ async function fanOutMessage(group, message, senderId) {
   members.forEach((m) => {
     send(m.userId, { type: "new_group_message", message: transportMessage, groupName: group.name,
       groupIcon: group.icon || null });
-    if (m.userId !== accountId(senderId) && !getUserSocket(accountId(m.userId))) {
+    if (m.userId !== accountId(senderId) && !isUserOnline(accountId(m.userId))) {
       sendOfflineMessageNotification({ receiverId: m.userId, message, group })
         .catch((error) => console.error("Could not send group notification:", error.message));
     }

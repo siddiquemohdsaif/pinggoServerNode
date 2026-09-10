@@ -1,5 +1,5 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
-const { getUserSocket, isUserViewingChat } = require("./connectionManager");
+const { getUserSockets, sendToUser, isUserViewingChat } = require("./connectionManager");
 const { sendOfflineMessageNotification } = require("./fcmService");
 const { isBlockedBy } = require("../utils/blockUtils");
 const { decodeMessageType, forStorage, chatForInternal } = require("../utils/messageTypes");
@@ -164,8 +164,8 @@ async function handleSendMessage(ws, payload, sendJson) {
         .updateDocument(attachmentCollection(chatId), attachmentId, "/", updatedAttachment)
         .catch(() => null);
     }
-    const receiverSocket = getUserSocket(receiverId);
-    const receiverOnline = Boolean(receiverSocket);
+    const receiverSockets = getUserSockets(receiverId);
+    const receiverOnline = receiverSockets.length > 0;
 
     // Acknowledge the sender as soon as the message is safely stored. Receiver delivery and
     // offline notification are independent and must never keep the sender in "sending" state.
@@ -180,15 +180,21 @@ async function handleSendMessage(ws, payload, sendJson) {
       message: forStorage(message),
     });
 
-    if (!suppressedForReceiver && receiverSocket) {
-      sendJson(receiverSocket, {
+    if (!suppressedForReceiver && receiverOnline) {
+      sendToUser(receiverId, {
         type: "new_message",
         message: forStorage(message),
         ...(receiverTotalUnread === null
           ? {}
           : { total_unread: receiverTotalUnread }),
-      });
+      }, sendJson);
     }
+    // Mirror an accepted outgoing message to the sender's other installations.
+    sendToUser(senderId, {
+      type: "new_message",
+      message: forStorage(message),
+      linkedDeviceSync: true,
+    }, sendJson, { exceptSocket: ws });
     if (!suppressedForReceiver && !isUserViewingChat(receiverId, chatId)) {
       sendFcmWithoutFailingMessage({ receiverId, message });
     }
@@ -296,14 +302,16 @@ async function handleSeenMessage(ws, payload, sendJson) {
   const totalUnread = await clearUnreadCount(ws.userId, chatId)
     .catch(() => null);
 
-  sendJson(ws, {
+  const seenAck = {
     type: "message_seen_ack",
     chatId,
     messageIds,
     readTime,
     status: "seen",
     ...(totalUnread === null ? {} : { total_unread: totalUnread }),
-  });
+  };
+  sendJson(ws, seenAck);
+  sendToUser(ws.userId, seenAck, sendJson, { exceptSocket: ws });
 
   notifyMessageSenders({
     chat,
@@ -393,16 +401,18 @@ async function handleEditMessage(ws, payload, sendJson) {
     message: forStorage(updatedMessage),
   });
 
+  const editedEvent = {
+    type: "message_edited",
+    chatId,
+    messageId,
+    text,
+    editedTime,
+    message: forStorage(updatedMessage),
+  };
+  sendToUser(ws.userId, editedEvent, sendJson, { exceptSocket: ws });
   notifyMessageReceiver({
     receiverId: updatedMessage.receiverId,
-    payload: {
-      type: "message_edited",
-      chatId,
-      messageId,
-      text,
-      editedTime,
-      message: forStorage(updatedMessage),
-    },
+    payload: editedEvent,
     sendJson,
   });
 }
@@ -496,15 +506,17 @@ async function handleDeleteMessage(ws, payload, sendJson) {
     message: forStorage(deletedMessage),
   });
 
+  const deletedEvent = {
+    type: "message_deleted",
+    chatId,
+    messageId,
+    deletedTime,
+    message: forStorage(deletedMessage),
+  };
+  sendToUser(ws.userId, deletedEvent, sendJson, { exceptSocket: ws });
   notifyMessageReceiver({
     receiverId: deletedMessage.receiverId,
-    payload: {
-      type: "message_deleted",
-      chatId,
-      messageId,
-      deletedTime,
-      message: forStorage(deletedMessage),
-    },
+    payload: deletedEvent,
     sendJson,
   });
 }
@@ -695,9 +707,10 @@ async function handlePinMessages(ws, payload, sendJson) {
     participants.add(normalizeAccountId(chat[id].receiverId));
   });
   participants.delete(ws.userId);
+  sendToUser(ws.userId, { type: "messages_pinned", ...result }, sendJson,
+    { exceptSocket: ws });
   participants.forEach((userId) => {
-    const socket = getUserSocket(userId);
-    if (socket) sendJson(socket, { type: "messages_pinned", ...result });
+    sendToUser(userId, { type: "messages_pinned", ...result }, sendJson);
   });
 }
 
@@ -742,9 +755,10 @@ async function handleUnpinMessages(ws, payload, sendJson) {
     participants.add(normalizeAccountId(chat[id].receiverId));
   });
   participants.delete(ws.userId);
+  sendToUser(ws.userId, { type: "messages_unpinned", ...result }, sendJson,
+    { exceptSocket: ws });
   participants.forEach((userId) => {
-    const socket = getUserSocket(userId);
-    if (socket) sendJson(socket, { type: "messages_unpinned", ...result });
+    sendToUser(userId, { type: "messages_unpinned", ...result }, sendJson);
   });
 }
 
@@ -831,14 +845,15 @@ async function handleForwardMessages(ws, payload, sendJson) {
     .filter(Boolean);
   sendJson(ws, { type: "forward_messages_ack", sourceChatId, destinationChatId,
     operationId, messages, forwardedMessageIds: pendingMessageIds, skippedMessageIds });
-  const receiverSocket = getUserSocket(receiverId);
   for (let index = 0; !suppressedForReceiver && index < newMessages.length; index += 1) {
     const message = newMessages[index];
-    if (receiverSocket) sendJson(receiverSocket, {
+    sendToUser(receiverId, {
       type: "new_message", message: forStorage(message),
       ...(index === newMessages.length - 1 && receiverTotalUnread !== null
         ? { total_unread: receiverTotalUnread } : {}),
-    });
+    }, sendJson);
+    sendToUser(senderId, { type: "new_message", message: forStorage(message),
+      linkedDeviceSync: true }, sendJson, { exceptSocket: ws });
     if (!isUserViewingChat(receiverId, destinationChatId)) {
       sendFcmWithoutFailingMessage({ receiverId, message });
     }
@@ -1005,16 +1020,15 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
     : await incrementUnreadCount(receiverId, chatId).catch(() => null);
   const visibleUsers = suppressedForReceiver ? [callerId] : [callerId, receiverId];
   for (const userId of visibleUsers) {
-    const socket = getUserSocket(userId);
     const participantMessage = { ...message,
       text: userId === callerId ? message.callerText : message.receiverText };
-    if (socket) sendJson(socket, {
+    sendToUser(userId, {
       type: "new_message",
       message: forStorage(participantMessage),
       ...(userId === receiverId && receiverTotalUnread !== null
         ? { total_unread: receiverTotalUnread }
         : {}),
-    });
+    }, sendJson);
   }
   // Call notifications are emitted by callHandler so completed calls never
   // appear as ordinary message notifications.
@@ -1202,18 +1216,12 @@ function notifyMessageSenders({ chat, messageIds, payload, sendJson }) {
   );
 
   senderIds.forEach((senderId) => {
-    const senderSocket = getUserSocket(senderId);
-    if (senderSocket) {
-      sendJson(senderSocket, payload);
-    }
+    sendToUser(senderId, payload, sendJson);
   });
 }
 
 function notifyMessageReceiver({ receiverId, payload, sendJson }) {
-  const receiverSocket = getUserSocket(normalizeAccountId(receiverId));
-  if (receiverSocket) {
-    sendJson(receiverSocket, payload);
-  }
+  sendToUser(normalizeAccountId(receiverId), payload, sendJson);
 }
 
 function sendMessageFailed(ws, sendJson, payload) {

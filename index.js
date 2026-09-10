@@ -26,7 +26,10 @@ const auth = require("./routes/auth");
 const files = require("./routes/files");
 const chatAttachments = require("./routes/chatAttachments");
 const groups = require("./routes/groups");
+const devices = require("./routes/devices");
+const deviceLinks = require("./routes/deviceLinks");
 const { maxFileSizeMb, uploadDir } = require("./utils/fileStorage");
+const { isDeviceRevoked } = require("./models/DeviceStore");
 
 // app.use(express.json());
 app.use(express.json({ limit: `${Math.ceil(maxFileSizeMb * 1.5)}mb` }));
@@ -39,15 +42,21 @@ app.use("/login", login);
 app.use("/otp", otp);
 app.use("/signup", signup);
 app.use("/auth", auth);
+app.use("/device-links", deviceLinks);
 app.use(files);
 
 // Authorization middleware
-const authMiddleware = (req, res, next) => {
-  if (!AES.validateEncryptedCredentialByHeader(req)) {
+const authMiddleware = async (req, res, next) => {
+  const claims = AES.getHeaderCredentialClaims(req);
+  if (!claims) {
     return res
       .status(401)
       .json({ success: false, message: "Authorization failed" });
   }
+  if (claims.deviceId && await isDeviceRevoked(claims.uid, claims.deviceId)) {
+    return res.status(401).json({ success: false, message: "This linked device has been logged out." });
+  }
+  req.auth = { userId: claims.uid, deviceId: claims.deviceId || null };
   next();
 };
 
@@ -59,6 +68,7 @@ authorizedRoutes.use("/chats/attachments", chatAttachments);
 authorizedRoutes.use("/chats", chats);
 authorizedRoutes.use("/calls", calls);
 authorizedRoutes.use("/groups", groups);
+authorizedRoutes.use("/devices", devices);
 
 app.use("/", authorizedRoutes); // Use the grouped routes
 

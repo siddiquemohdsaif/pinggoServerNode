@@ -1,5 +1,5 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
-const { getUserSocket, isUserOnline } = require("./connectionManager");
+const { sendToUser, isUserOnline } = require("./connectionManager");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -47,10 +47,7 @@ async function updateUserPresence(userId, presenceFields) {
 async function notifyPresenceToContacts(userId, payload, sendJson) {
   const contactIds = await getChatContactIds(userId);
   contactIds.forEach((contactId) => {
-    const contactSocket = getUserSocket(contactId);
-    if (contactSocket) {
-      sendJson(contactSocket, payload);
-    }
+    sendToUser(contactId, payload, sendJson);
   });
 }
 
@@ -66,20 +63,20 @@ async function handleTypingEvent(ws, payload, sendJson, eventType) {
     return;
   }
 
-  const receiverSocket = getUserSocket(receiverId);
-  if (receiverSocket) {
-    sendJson(receiverSocket, {
+  const receiverOnline = isUserOnline(receiverId);
+  if (receiverOnline) {
+    sendToUser(receiverId, {
       type: eventType,
       chatId,
       userId: ws.userId,
-    });
+    }, sendJson);
   }
 
   sendJson(ws, {
     type: `${eventType}_ack`,
     chatId,
     receiverId,
-    receiverOnline: Boolean(receiverSocket),
+    receiverOnline,
   });
 }
 

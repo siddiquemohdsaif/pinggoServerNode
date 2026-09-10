@@ -4,6 +4,8 @@ const {
   addUser,
   removeUser,
   getOnlineUserCount,
+  getOnlineDeviceCount,
+  isUserOnline,
   setActiveChat,
 } = require("./connectionManager");
 const {
@@ -31,6 +33,7 @@ const {
   handleCallDisconnect,
 } = require("./callHandler");
 const { sendGroupMessage, markGroupMessages } = require("../services/groupService");
+const { isDeviceRevoked, touchDevice } = require("../models/DeviceStore");
 
 function createWebSocketServer() {
   const wss = new WebSocketServer({ noServer: true });
@@ -56,7 +59,8 @@ function createWebSocketServer() {
     });
 
     ws.on("close", () => {
-      console.log(`[signal-socket] closed userId=${ws.userId || "unauthenticated"} time=${Date.now()}`);
+      console.log(`[signal-socket] closed userId=${ws.userId || "unauthenticated"}`
+        + ` deviceId=${ws.deviceId || "unknown"} time=${Date.now()}`);
       handleCallDisconnect(ws.userId, sendJson).catch(() => null);
       removeUser(ws.userId, ws);
       handleDisconnect(ws).catch(() => null);
@@ -224,12 +228,36 @@ async function handleAuth(ws, message) {
     return;
   }
 
-  addUser(credentials.userId, ws);
-  console.log(`[signal-auth] success userId=${credentials.userId} time=${Date.now()}`);
+  const credentialClaims = AES.getEncryptedCredentialClaims(credentials.encryptedCredential);
+  if (credentialClaims && credentialClaims.deviceId
+      && credentialClaims.deviceId !== credentials.deviceId) {
+    sendJson(ws, { type: "auth_failed", message: "Device credential mismatch." });
+    ws.close(4001, "Authentication failed.");
+    return;
+  }
+
+  // Only device-bound companion credentials are invalidated by a device revocation.
+  // A normal login credential is account-bound and may legitimately arrive from an
+  // installation whose old device record was revoked under this or another session.
+  const boundDeviceId = credentialDeviceId(credentialClaims);
+  if (boundDeviceId && await isDeviceRevoked(credentials.userId, boundDeviceId)) {
+    sendJson(ws, {
+      type: "auth_failed",
+      message: "This linked device has been logged out.",
+    });
+    ws.close(4003, "Device revoked.");
+    return;
+  }
+
+  const deviceId = addUser(credentials.userId, credentials.deviceId, ws);
+  if (credentials.deviceId) touchDevice(credentials.userId, deviceId).catch(() => null);
+  console.log(`[signal-auth] success userId=${credentials.userId} deviceId=${deviceId} time=${Date.now()}`);
   sendJson(ws, {
     type: "auth_success",
     userId: credentials.userId,
+    deviceId,
     onlineUserCount: getOnlineUserCount(),
+    onlineDeviceCount: getOnlineDeviceCount(),
   });
   deliverPendingCallsForUser(credentials.userId, sendJson);
 
@@ -254,6 +282,7 @@ async function handleDisconnect(ws) {
     return;
   }
 
+  if (isUserOnline(userId)) return;
   const lastSeen = await markUserOffline(userId);
   await notifyPresenceToContacts(
     userId,
@@ -272,7 +301,7 @@ function getAuthCredentials(ws, message) {
     message.authorization || message.token || ws.authorization,
   );
   if (tokenCredentials.userId && tokenCredentials.encryptedCredential) {
-    return tokenCredentials;
+    return { ...tokenCredentials, deviceId: normalizeDeviceId(message.deviceId) };
   }
 
   return {
@@ -282,6 +311,7 @@ function getAuthCredentials(ws, message) {
     encryptedCredential:
       normalizeString(message.encryptedCredential) ||
       normalizeString(message.credential),
+    deviceId: normalizeDeviceId(message.deviceId),
   };
 }
 
@@ -299,7 +329,18 @@ function parseAuthorizationToken(value) {
   return {
     userId: normalizeAccountId(token.slice(0, separatorIndex)),
     encryptedCredential: token.slice(separatorIndex + 1),
+    deviceId: "",
   };
+}
+
+function normalizeDeviceId(value) {
+  const normalized = normalizeString(value);
+  return /^[A-Za-z0-9._:-]{8,128}$/.test(normalized) ? normalized : "";
+}
+
+function credentialDeviceId(claims) {
+  return claims && typeof claims.deviceId === "string"
+    ? normalizeDeviceId(claims.deviceId) : "";
 }
 
 function normalizeAccountId(value) {
@@ -323,4 +364,5 @@ function sendJson(ws, payload) {
 
 module.exports = {
   createWebSocketServer,
+  credentialDeviceId,
 };
