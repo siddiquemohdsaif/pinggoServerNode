@@ -1,7 +1,7 @@
 const express = require("express");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { getUserSocket } = require("../realtime/connectionManager");
-const { isBlockedBy, setBlocked } = require("../utils/blockUtils");
+const { isBlockedBy, setBlocked, listBlocked } = require("../utils/blockUtils");
 const { chatForInternal, forStorage } = require("../utils/messageTypes");
 const { reportForStorage, reportForInternal } = require("../utils/specializedRecords");
 const firestoreManager = FirestoreManager.getInstance();
@@ -286,6 +286,19 @@ router.post("/block-status", async (req, res) => {
 
 router.post("/block", async (req, res) => changeBlockState(req, res, true));
 router.post("/unblock", async (req, res) => changeBlockState(req, res, false));
+
+router.post("/blocked-accounts", async (req, res) => {
+  try {
+    const phoneNumber = normalizePhoneNumber(req.auth && req.auth.userId);
+    if (!phoneNumber) return res.status(401).json({ success: false, message: "Authentication required." });
+    const validationError = validatePhoneNumber({ phoneNumber });
+    if (validationError) return res.status(400).json({ success: false, message: validationError });
+    return res.status(200).json({ success: true,
+      blockedAccounts: await listBlocked(phoneNumber) });
+  } catch (error) {
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
 
 async function changeBlockState(req, res, blocked) {
   try {

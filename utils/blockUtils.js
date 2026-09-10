@@ -31,9 +31,25 @@ async function setBlocked(ownerId, otherId, chatId, blocked) {
   return value.updatedAt;
 }
 
+async function listBlocked(ownerId) {
+  const owner = normalize(ownerId);
+  if (!owner) return [];
+  try {
+    const document = await firestoreManager.readDocument("UserBlocks", owner, "/");
+    return Object.entries((document && document.blockedUsers) || {}).map(([userId, value]) => ({
+      userId: normalize(userId),
+      chatId: value && typeof value === "object" ? String(value.chatId || "") : "",
+      blockedAt: value && typeof value === "object" ? Number(value.blockedAt || 0) : 0,
+    })).filter((entry) => entry.userId)
+      .sort((a, b) => b.blockedAt - a.blockedAt || a.userId.localeCompare(b.userId));
+  } catch (_error) {
+    return [];
+  }
+}
+
 function normalize(value) {
   return (typeof value === "string" ? value.trim() : "")
     .replace(/^<plus>/, "").replace(/^\+/, "");
 }
 
-module.exports = { isBlockedBy, setBlocked };
+module.exports = { isBlockedBy, setBlocked, listBlocked };
