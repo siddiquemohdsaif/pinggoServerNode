@@ -272,6 +272,34 @@ async function leaveGroup(groupId, userId, successorAdminId) {
   return group;
 }
 
+async function removeDeletedAccount(groupId, userId) {
+  const group = await readGroup(groupId);
+  const id = accountId(userId);
+  const member = activeMember(group, id);
+  if (!member) return null;
+  const now = Date.now();
+  const others = Object.values(group.members || {}).filter((m) =>
+    m && m.userId !== id && m.status === "active");
+  if (ownerId(group) === id) {
+    const successor = others.find((m) => m.role === "admin") || others[0];
+    group.ownerId = successor ? successor.userId : "";
+    if (successor) group.members[successor.userId] = { ...successor, role: "admin",
+      promotedAt: now, roleChangedBy: id };
+  }
+  // Persist/fan out the timeline pill while the remaining membership is still authoritative.
+  const leaveMessage = await systemMessage(group, id, "member_left", [id],
+    { deletedAccount: true });
+  group.members[id] = { ...member, status: "deleted", leftAt: now, profilePhotoUrl: null };
+  const periods = membershipPeriods(group.members[id]);
+  if (periods.length) periods[periods.length - 1].leftAt = now;
+  group.members[id].membershipPeriods = periods;
+  group.updatedAt = now;
+  group.membershipVersion = Number(group.membershipVersion || 0) + 1;
+  await writeGroup(group);
+  broadcast(group, { type: "group_updated", group: publicGroup(group) });
+  return { message: leaveMessage, memberIds: others.map((m) => m.userId) };
+}
+
 async function setRole(groupId, actorId, memberId, role) {
   const group = await readGroup(groupId); requireAdmin(group, actorId);
   const currentOwnerId = ownerId(group);
@@ -390,4 +418,5 @@ async function markGroupMessages(ws, payload, sendJson, state) {
 
 module.exports = { activeMember, memberCanAccessAt, memberCanAccessMessage,
   createGroup, changeMembers, leaveGroup, publicGroup, readChat,
-  readGroup, requireAdmin, requireMember, sendGroupMessage, markGroupMessages, setRole, updateGroup };
+  readGroup, requireAdmin, requireMember, removeDeletedAccount, sendGroupMessage,
+  markGroupMessages, setRole, updateGroup };

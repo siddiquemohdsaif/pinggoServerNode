@@ -4,6 +4,7 @@ const UserModel = require("../models/UserModel");
 const AES = require("../utils/AES_256");
 const { generateP_ID, createP_ID_DOC } = require("../utils/signupUtils");
 const { ensureAccountCollections } = require("../models/AccountStore");
+const { isAccountDeleted } = require("../services/accountDeletionService");
 
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
@@ -22,6 +23,10 @@ router.post("/", async (req, res) => {
     }
 
     const accountId = formatPhoneNumberForAccountId(phoneNumber);
+    if (await isAccountDeleted(accountId)) {
+      return res.status(409).json({ success: false,
+        message: "This account was deleted. Confirm reactivation from the login screen." });
+    }
     const existingUserData = await getUserByPhoneNumber(accountId);
     if (existingUserData) {
       await ensureAccountCollections(accountId);
@@ -53,7 +58,6 @@ router.post("/", async (req, res) => {
     await firestoreManager.createDocument("Users", accountId, "/", userModel);
 
     await ensureAccountCollections(accountId);
-
     return res.status(200).json({
       success: true,
       userData: userModel,

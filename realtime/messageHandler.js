@@ -6,6 +6,7 @@ const { decodeMessageType, forStorage, chatForInternal } = require("../utils/mes
 const { nextTimestamp } = require("../utils/timestampId");
 const { ensureShardedContainer, readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { ensureAccountCollections } = require("../models/AccountStore");
+const { isAccountDeleted } = require("../services/accountDeletionService");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -64,6 +65,11 @@ async function handleSendMessage(ws, payload, sendJson) {
   if (await isBlockedBy(senderId, receiverId)) {
     sendMessageFailed(ws, sendJson, { clientMessageId, chatId,
       message: "Unblock this contact to send a message." });
+    return;
+  }
+  if (await isAccountDeleted(receiverId)) {
+    sendMessageFailed(ws, sendJson, { clientMessageId, chatId,
+      message: "This user no longer has a Pinggo account." });
     return;
   }
 

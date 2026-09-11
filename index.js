@@ -27,9 +27,12 @@ const files = require("./routes/files");
 const chatAttachments = require("./routes/chatAttachments");
 const groups = require("./routes/groups");
 const devices = require("./routes/devices");
+const account = require("./routes/account");
 const deviceLinks = require("./routes/deviceLinks");
 const { maxFileSizeMb, uploadDir } = require("./utils/fileStorage");
 const { isDeviceRevoked } = require("./models/DeviceStore");
+const { isAccountDeleted, isCurrentPrimaryCredential } =
+  require("./services/accountDeletionService");
 
 // app.use(express.json());
 app.use(express.json({ limit: `${Math.ceil(maxFileSizeMb * 1.5)}mb` }));
@@ -53,6 +56,12 @@ const authMiddleware = async (req, res, next) => {
       .status(401)
       .json({ success: false, message: "Authorization failed" });
   }
+  if (await isAccountDeleted(claims.uid)) {
+    return res.status(401).json({ success: false, message: "This account has been deleted." });
+  }
+  if (!claims.deviceId && !await isCurrentPrimaryCredential(claims.uid, claims.context)) {
+    return res.status(401).json({ success: false, message: "This session is no longer valid." });
+  }
   if (claims.deviceId && await isDeviceRevoked(claims.uid, claims.deviceId)) {
     return res.status(401).json({ success: false, message: "This linked device has been logged out." });
   }
@@ -69,6 +78,7 @@ authorizedRoutes.use("/chats", chats);
 authorizedRoutes.use("/calls", calls);
 authorizedRoutes.use("/groups", groups);
 authorizedRoutes.use("/devices", devices);
+authorizedRoutes.use("/account", account);
 
 app.use("/", authorizedRoutes); // Use the grouped routes
 

@@ -4,6 +4,7 @@ const { saveCallMessage } = require("./messageHandler");
 const { saveCallLog } = require("../models/CallLogStore");
 const { isBlockedBy } = require("../utils/blockUtils");
 const { sendCallNotification, sendCallCancelledNotification } = require("./fcmService");
+const { isAccountDeleted } = require("../services/accountDeletionService");
 
 const calls = new Map();
 const callEndedListeners = new Set();
@@ -137,6 +138,11 @@ async function handleInvite(ws, payload, sendJson) {
   if (await isBlockedBy(ws.userId, receiverId)) {
     sendJson(ws, { type: "call_failed", callId: requestedCallId,
       message: "Unblock this contact to make a call." });
+    return true;
+  }
+  if (await isAccountDeleted(receiverId)) {
+    sendJson(ws, { type: "call_failed", callId: requestedCallId,
+      message: "This user no longer has a Pinggo account." });
     return true;
   }
 
