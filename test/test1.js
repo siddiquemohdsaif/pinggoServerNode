@@ -10,6 +10,7 @@ const { upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { MESSAGE_TYPE_CODES, forStorage } = require("../utils/messageTypes");
 const { saveFile } = require("../utils/fileStorage");
 const { ensureAccountCollections } = require("../models/AccountStore");
+const { saveCallLog } = require("../models/CallLogStore");
 const AES = require("../utils/AES_256");
 
 const firestoreManager = FirestoreManager.getInstance();
@@ -155,7 +156,9 @@ async function addChatToList(phoneNumber, chatId, lastMessage) {
 }
 function baseMessage({ chatId, senderId, receiverId, messageType, sentTime, sequence }) {
   return {
-    id: `${sentTime}-${sequence}`, clientMessageId: `demo-${crypto.randomUUID()}`, chatId, senderId, receiverId,
+    // Production messages use their millisecond timestamp as both the Firestore
+    // entry key and message id. The generated timestamps below are already unique.
+    id: String(sentTime), clientMessageId: `demo-${crypto.randomUUID()}`, chatId, senderId, receiverId,
     text: "", messageType, sentTime, deliveredTime: sentTime + 250, readTime: sentTime + 500,
     status: "seen", invisible: [],
   };
@@ -186,12 +189,16 @@ async function createMessage({ chatId, senderId, receiverId, messageType, sentTi
   }
   if (messageType === "voice_call" || messageType === "video_call") {
     const durationSeconds = 5 + sequence % 176;
+    const participantIds = [senderId, receiverId];
     Object.assign(message, {
       clientMessageId: null, callId: crypto.randomUUID(),
       text: messageType === "video_call" ? "Video Call" : "Voice Call", callDurationSeconds: durationSeconds,
       callCreatedAt: sentTime - (durationSeconds + 3) * 1000, callRingingAt: sentTime - (durationSeconds + 2) * 1000,
       callConnectedAt: sentTime - durationSeconds * 1000, callEndedAt: sentTime,
       callTerminationReason: "hangup", callerText: "Outgoing call", receiverText: "Incoming call",
+      conferenceCall: false, groupCall: false, callParticipantIds: participantIds,
+      callParticipantDurationsSeconds: Object.fromEntries(
+        participantIds.map((participantId) => [participantId, durationSeconds])),
     });
   }
   if (messageType === "report") Object.assign(message, { text: "Message reported for demo testing", reportReason: "demo_report", reportedMessageId: "demo-reported-message" });
@@ -210,18 +217,48 @@ async function startExecution(options = {}) {
   const messageTypes = buildRandomizedSequence(MESSAGE_TYPES, messageCount);
   const now = Date.now();
   const messages = {};
+  const callMessages = [];
   for (let index = 0; index < messageCount; index += 1) {
     const outgoing = index % 2 === 0;
     const message = await createMessage({ chatId, senderId: outgoing ? account.phoneNumber : TARGET_PHONE_NUMBER,
       receiverId: outgoing ? TARGET_PHONE_NUMBER : account.phoneNumber, messageType: messageTypes[index],
       sentTime: now - (messageCount - index) * 1000, sequence: index, assets });
     messages[message.id] = forStorage(message);
+    if (message.callId) callMessages.push(message);
   }
   const writeResult = await upsertShardedEntries("Chats", chatId, messages);
   const latestMessage = Object.values(messages).sort((a, b) => a.sentTime - b.sentTime).at(-1);
-  await Promise.all([addChatToList(account.phoneNumber, chatId, latestMessage), addChatToList(TARGET_PHONE_NUMBER, chatId, latestMessage)]);
+  const latestForSender = { ...latestMessage,
+    text: latestMessage.callerText || latestMessage.text };
+  const latestForReceiver = { ...latestMessage,
+    text: latestMessage.receiverText || latestMessage.text };
+  await Promise.all([
+    addChatToList(latestMessage.senderId, chatId, latestForSender),
+    addChatToList(latestMessage.receiverId, chatId, latestForReceiver),
+    ...callMessages.map((message) => saveCallLog({
+      callId: message.callId,
+      messageId: message.id,
+      chatId: message.chatId,
+      callerId: message.senderId,
+      receiverId: message.receiverId,
+      mediaType: message.messageType === "video_call" ? "video" : "audio",
+      state: "ended",
+      terminationReason: message.callTerminationReason,
+      createdAt: message.callCreatedAt,
+      ringingAt: message.callRingingAt,
+      connectedAt: message.callConnectedAt,
+      endedAt: message.callEndedAt,
+      participantIds: message.callParticipantIds,
+      historyParticipantIds: message.callParticipantIds,
+      participantJoinedAt: Object.fromEntries(message.callParticipantIds
+        .map((participantId) => [participantId, message.callConnectedAt])),
+      participantLeftAt: Object.fromEntries(message.callParticipantIds
+        .map((participantId) => [participantId, message.callEndedAt])),
+      conference: false,
+    })),
+  ]);
   const includedTypes = [...new Set(messageTypes)];
-  console.log(`Created ${messageCount} messages in sharded chat ${chatId}.`);
+  console.log(`Created ${messageCount} messages and ${callMessages.length} per-user call logs in sharded chat ${chatId}.`);
   console.log(`Included types: ${includedTypes.join(", ")}.`);
   return { account, chatId, messageCount, messageTypes: includedTypes, writeResult };
 }

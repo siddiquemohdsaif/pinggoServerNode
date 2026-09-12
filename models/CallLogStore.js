@@ -10,25 +10,9 @@ function normalizeId(value) {
   return String(value || "").trim().replace(/^<plus>/, "").replace(/^\+/, "");
 }
 
-function withoutDocumentId(document) {
-  const copy = { ...(document || {}) };
-  delete copy._id;
-  return copy;
-}
-
 async function readDocumentOrNull(collection, documentId) {
   try { return (await firestore.readDocument(collection, documentId, "/")) || null; }
   catch (_error) { return null; }
-}
-
-async function upsertDocument(collection, documentId, document, exists) {
-  try {
-    return exists
-      ? await firestore.updateDocument(collection, documentId, "/", document)
-      : await firestore.createDocument(collection, documentId, "/", document);
-  } catch (_error) {
-    return firestore.updateDocument(collection, documentId, "/", document);
-  }
 }
 
 function normalizeList(value) {
@@ -37,6 +21,16 @@ function normalizeList(value) {
 
 function buildLog(call) {
   const endedAt = Number(call.endedAt) || Date.now();
+  const participantIds = Array.isArray(call.historyParticipantIds || call.participantIds)
+    ? [...new Set((call.historyParticipantIds || call.participantIds)
+      .map(normalizeId).filter(Boolean))] : [];
+  const participantDurationsSeconds = {};
+  for (const userId of participantIds) {
+    const joinedAt = Number(call.participantJoinedAt && call.participantJoinedAt[userId]);
+    const leftAt = Number(call.participantLeftAt && call.participantLeftAt[userId]) || endedAt;
+    participantDurationsSeconds[userId] = joinedAt
+      ? Math.max(0, Math.floor((leftAt - joinedAt) / 1000)) : 0;
+  }
   return {
     callId: String(call.callId),
     messageId: String(call.messageId || ""),
@@ -52,36 +46,59 @@ function buildLog(call) {
     endedAt,
     durationSeconds: call.connectedAt
       ? Math.max(0, Math.floor((endedAt - Number(call.connectedAt)) / 1000)) : 0,
+    groupCall: String(call.chatId || "").startsWith("grp_"),
+    conference: Boolean(call.conference || String(call.chatId || "").startsWith("grp_")
+      || (Array.isArray(call.participantIds) && call.participantIds.length > 2)),
+    participantIds,
+    participantDurationsSeconds,
   };
-}
-
-async function updateCallsList(userId, otherUserId, log) {
-  const existing = await readDocumentOrNull(LIST_COLLECTION, userId);
-  const list = normalizeList(existing && existing.list);
-  const current = list[log.chatId];
-  const currentEndedAt = Number(current && current.lastCall && current.lastCall.endedAt) || 0;
-  if (currentEndedAt > log.endedAt) return;
-  await upsertDocument(LIST_COLLECTION, userId, {
-    ...withoutDocumentId(existing),
-    list: { ...list, [log.chatId]: {
-      chatId: log.chatId, otherUserId, lastCall: callLogForStorage(log),
-    } },
-  }, Boolean(existing));
 }
 
 async function saveCallLog(call) {
   if (!call || !call.callId) throw new Error("callId is required.");
   const log = buildLog(call);
   if (!log.chatId) throw new Error("chatId is required.");
-  if (!log.callerId || !log.receiverId) throw new Error("Call participants are required.");
-  await upsertShardedEntries(LOG_COLLECTION, log.chatId, {
-    [log.callId]: callLogForStorage(log),
-  }, "calls");
-  await Promise.all([
-    updateCallsList(log.callerId, log.receiverId, log),
-    updateCallsList(log.receiverId, log.callerId, log),
-  ]);
+  if (!log.callerId || (!log.receiverId && !log.conference))
+    throw new Error("Call participants are required.");
+  const participants = log.participantIds.length
+    ? log.participantIds : [log.callerId, log.receiverId].filter(Boolean);
+  await Promise.all(participants.map((userId) => upsertShardedEntries(
+    LOG_COLLECTION, userId, { [log.callId]: callLogForStorage({
+      ...log, durationSeconds:
+        log.participantDurationsSeconds[userId] ?? log.durationSeconds,
+    }) }, "calls")));
   return log;
+}
+
+async function readUserTimeline(userId) {
+  const timeline = await readShardedMap(LOG_COLLECTION, userId, "calls");
+  const merged = new Map(Object.entries(timeline || {})
+    .filter(([key, value]) => key !== "_id" && value && typeof value === "object"));
+
+  // CallsList is only a migration index now. Use its chat ids to discover historical logs,
+  // merge them into the per-user timeline, and backfill the new store on first read.
+  const legacyList = await readDocumentOrNull(LIST_COLLECTION, userId);
+  const chatIds = Object.keys(normalizeList(legacyList && legacyList.list));
+  const legacyDocuments = await Promise.all(chatIds.map((chatId) =>
+    readShardedMap(LOG_COLLECTION, chatId, "calls")));
+  const backfill = {};
+  for (const document of legacyDocuments) {
+    for (const [callId, value] of Object.entries(document || {})) {
+      if (callId === "_id" || !value || typeof value !== "object" || merged.has(callId)) continue;
+      const log = callLogForClient(value);
+      const participants = Array.isArray(log.participantIds) && log.participantIds.length
+        ? log.participantIds.map(normalizeId) : [normalizeId(log.callerId), normalizeId(log.receiverId)];
+      if (!participants.includes(userId)) continue;
+      const userLog = { ...log, durationSeconds:
+        log.participantDurationsSeconds?.[userId] ?? log.durationSeconds };
+      merged.set(callId, callLogForStorage(userLog));
+      backfill[callId] = callLogForStorage(userLog);
+    }
+  }
+  if (Object.keys(backfill).length) {
+    await upsertShardedEntries(LOG_COLLECTION, userId, backfill, "calls");
+  }
+  return merged;
 }
 
 function pageCalls(values, pageSize, cursor, keyField) {
@@ -117,31 +134,26 @@ function pageCalls(values, pageSize, cursor, keyField) {
 async function getCallsList(userId, pageSize, cursor) {
   const id = normalizeId(userId);
   if (!id) return { calls: [], hasMore: false, nextCursor: null };
-  const document = await readDocumentOrNull(LIST_COLLECTION, id);
-  const values = Object.entries(normalizeList(document && document.list))
-    .map(([chatId, entry]) => ({
-      ...callLogForClient(entry && entry.lastCall ? entry.lastCall : entry),
-      chatId,
-      otherUserId: normalizeId(entry && entry.otherUserId),
-    }))
+  const document = await readUserTimeline(id);
+  const values = [...document.values()]
+    .map((value) => callLogForClient(value))
     .sort((a, b) => (Number(b.endedAt) || 0) - (Number(a.endedAt) || 0)
-      || String(a.chatId).localeCompare(String(b.chatId)));
-  return pageCalls(values, pageSize, cursor, "chatId");
+      || String(a.callId).localeCompare(String(b.callId)));
+  return pageCalls(values, pageSize, cursor, "callId");
 }
 
 async function getCallLogs(userId, chatId, pageSize, cursor) {
   const id = normalizeId(userId);
   const normalizedChatId = String(chatId || "").trim();
   if (!id || !normalizedChatId) return { calls: [], hasMore: false, nextCursor: null };
-  if (!normalizedChatId.split("_").map(normalizeId).includes(id)) {
-    const error = new Error("phoneNumber must be a participant in chatId.");
-    error.statusCode = 403;
-    throw error;
-  }
-  const document = await readShardedMap(LOG_COLLECTION, normalizedChatId, "calls");
-  const values = Object.entries(document || {})
-    .filter(([key, value]) => key !== "_id" && value && typeof value === "object")
-    .map(([, value]) => callLogForClient(value))
+  const document = await readUserTimeline(id);
+  const values = [...document.values()]
+    .map((value) => {
+      const log = callLogForClient(value);
+      return { ...log, durationSeconds:
+        log.participantDurationsSeconds?.[id] ?? log.durationSeconds };
+    })
+    .filter((log) => log.chatId === normalizedChatId)
     .sort((a, b) => (Number(b.endedAt) || 0) - (Number(a.endedAt) || 0)
       || String(a.callId).localeCompare(String(b.callId)));
   return pageCalls(values, pageSize, cursor, "callId");

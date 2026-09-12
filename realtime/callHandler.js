@@ -5,6 +5,7 @@ const { saveCallLog } = require("../models/CallLogStore");
 const { isBlockedBy } = require("../utils/blockUtils");
 const { sendCallNotification, sendCallCancelledNotification } = require("./fcmService");
 const { isAccountDeleted } = require("../services/accountDeletionService");
+const groupService = require("../services/groupService");
 
 const calls = new Map();
 const callEndedListeners = new Set();
@@ -19,6 +20,7 @@ const RELAY_TYPES = new Set([
   "call_reject",
   "call_busy",
   "call_end",
+  "call_leave",
 ]);
 
 async function handleCallEvent(ws, payload, sendJson) {
@@ -27,6 +29,9 @@ async function handleCallEvent(ws, payload, sendJson) {
     + ` time=${Date.now()}`);
   cleanupExpiredCalls();
   if (payload.type === "call_invite") return handleInvite(ws, payload, sendJson);
+  if (payload.type === "call_add_participants") {
+    return handleAddLiveKitParticipants(ws, payload, sendJson);
+  }
   if (!RELAY_TYPES.has(payload.type)) return false;
 
   const callId = string(payload.callId);
@@ -38,6 +43,10 @@ async function handleCallEvent(ws, payload, sendJson) {
   if (isTerminal(call.state)) {
     sendJson(ws, { type: "call_failed", callId, message: "Call has already ended." });
     return true;
+  }
+
+  if (call.engine === "livekit" && Array.isArray(call.participantIds)) {
+    return handleLiveKitRelay(ws, payload, call, sendJson);
   }
 
   const expectedReceiver = ws.userId === call.callerId ? call.receiverId : call.callerId;
@@ -112,11 +121,77 @@ async function handleCallEvent(ws, payload, sendJson) {
   return true;
 }
 
+async function handleAddLiveKitParticipants(ws, payload, sendJson) {
+  const callId = string(payload.callId);
+  const call = calls.get(callId);
+  if (!call || call.engine !== "livekit" || !isParticipant(call, ws.userId)) {
+    sendJson(ws, { type: "call_failed", callId,
+      message: "LiveKit call not found or access denied." });
+    return true;
+  }
+  const existing = new Set(Array.isArray(call.participantIds)
+    ? call.participantIds.map(account)
+    : [account(call.callerId), account(call.receiverId)]);
+  const requested = Array.isArray(payload.participantIds)
+    ? payload.participantIds.map(account).filter(Boolean) : [];
+  const additions = [...new Set(requested)].filter((id) => !existing.has(id));
+  if (!additions.length) {
+    sendJson(ws, { type: "call_participants_added", callId, participantIds: [] });
+    return true;
+  }
+  if (existing.size + additions.length > 20) {
+    sendJson(ws, { type: "call_failed", callId, message: "A call supports up to 20 members." });
+    return true;
+  }
+  const accepted = [];
+  for (const userId of additions) {
+    if (await isAccountDeleted(userId) || await isBlockedBy(ws.userId, userId)
+        || await isBlockedBy(userId, ws.userId)) continue;
+    existing.add(userId);
+    accepted.push(userId);
+  }
+  call.participantIds = [...existing];
+  call.invitedByParticipant = call.invitedByParticipant || {};
+  for (const userId of accepted) call.invitedByParticipant[userId] = account(ws.userId);
+  call.historyParticipantIds = [...new Set([
+    ...(call.historyParticipantIds || []), ...accepted,
+  ])];
+  if (call.participantIds.length > 2) call.conference = true;
+  call.updatedAt = Date.now();
+  for (const userId of accepted) {
+    const event = { type: "call_invite", engine: "livekit", callId, chatId: call.chatId,
+      callerId: ws.userId, senderId: ws.userId, receiverId: userId,
+      mediaType: call.mediaType, callMode: "group",
+      participantIds: [...call.participantIds], serverTime: Date.now() };
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, event);
+    if (!isUserViewingChat(userId, call.chatId)) {
+      sendCallNotification({ receiverId: userId,
+        call: { ...call, callerId: ws.userId } }).catch((error) =>
+        console.error("Could not send added call-member notification:", error.message));
+    }
+  }
+  const update = { type: "call_participants_added", engine: "livekit", callId,
+    participantIds: [...call.participantIds], addedParticipantIds: accepted,
+    addedBy: ws.userId, serverTime: Date.now() };
+  for (const userId of call.participantIds) {
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, update);
+  }
+  console.log(`[call] livekitParticipantsAdded callId=${callId} addedBy=${ws.userId}`
+    + ` accepted=${accepted.length} total=${call.participantIds.length}`);
+  return true;
+}
+
 async function handleInvite(ws, payload, sendJson) {
   const receiverId = account(payload.receiverId);
   const requestedCallId = string(payload.callId);
   const chatId = string(payload.chatId);
   const mediaType = payload.mediaType === "video" ? "video" : "audio";
+  const engine = payload.engine === "livekit" ? "livekit" : "legacy";
+  if (engine === "livekit" && chatId.startsWith("grp_")) {
+    return handleLiveKitGroupInvite(ws, payload, chatId, mediaType, sendJson);
+  }
   console.log(`[call] invite callId=${requestedCallId || "generated"} caller=${ws.userId}`
     + ` receiver=${receiverId} mediaType=${mediaType} chatId=${chatId} time=${Date.now()}`);
   console.log(`[call] offerSdp callId=${requestedCallId || "generated"}`
@@ -127,7 +202,7 @@ async function handleInvite(ws, payload, sendJson) {
     sendJson(ws, { type: "call_failed", callId: requestedCallId, message: "Valid receiverId is required." });
     return true;
   }
-  if (!validDescription(payload.sdp, "offer")) {
+  if (engine === "legacy" && !validDescription(payload.sdp, "offer")) {
     sendJson(ws, { type: "call_failed", callId: requestedCallId, message: "Valid SDP offer is required." });
     return true;
   }
@@ -175,6 +250,10 @@ async function handleInvite(ws, payload, sendJson) {
   }
 
   if (hasActiveCall(ws.userId) || hasActiveCall(receiverId)) {
+    console.log(`[call-connection] phase=busy_rejected callId=${requestedCallId}`
+      + ` caller=${ws.userId} receiver=${receiverId}`
+      + ` callerBusy=${hasActiveCall(ws.userId)} receiverBusy=${hasActiveCall(receiverId)}`
+      + ` serverTime=${Date.now()}`);
     sendJson(ws, { type: "call_busy", callId: requestedCallId, receiverId });
     return true;
   }
@@ -182,7 +261,14 @@ async function handleInvite(ws, payload, sendJson) {
   const callId = requestedCallId || randomUUID();
   const suppressedForReceiver = await isBlockedBy(receiverId, ws.userId);
   const receiverSocket = suppressedForReceiver ? null : getUserSocket(receiverId);
-  const call = { callId, chatId, callerId: ws.userId, receiverId, mediaType,
+  const call = { callId, chatId, callerId: ws.userId, receiverId, mediaType, engine,
+    participantIds: engine === "livekit" ? [account(ws.userId), receiverId] : undefined,
+    historyParticipantIds: engine === "livekit" ? [account(ws.userId), receiverId] : undefined,
+    joinedParticipantIds: engine === "livekit" ? [account(ws.userId)] : undefined,
+    invitedByParticipant: engine === "livekit" ? { [receiverId]: account(ws.userId) } : undefined,
+    participantJoinedAt: engine === "livekit" ? {} : undefined,
+    participantLeftAt: engine === "livekit" ? {} : undefined,
+    conference: false,
     state: receiverSocket ? "ringing" : "calling", offer: payload.sdp,
     suppressedForReceiver,
     createdAt: Date.now(), ringingAt: receiverSocket ? Date.now() : null,
@@ -204,6 +290,120 @@ async function handleInvite(ws, payload, sendJson) {
   return true;
 }
 
+async function handleLiveKitGroupInvite(ws, payload, chatId, mediaType, sendJson) {
+  const group = await groupService.readGroup(chatId);
+  groupService.requireMember(group, ws.userId);
+  const participantIds = Object.values(group.members || {})
+    .filter((member) => member.status === "active")
+    .map((member) => account(member.userId));
+  const callId = string(payload.callId) || randomUUID();
+  const existing = calls.get(callId);
+  if (existing) {
+    sendJson(ws, { type: "call_invite_ack", callId, engine: "livekit",
+      state: existing.state, duplicate: true, serverTime: Date.now() });
+    return true;
+  }
+  const call = { callId, chatId, callerId: ws.userId, receiverId: "",
+    participantIds, historyParticipantIds: [...participantIds], mediaType,
+    joinedParticipantIds: [account(ws.userId)], engine: "livekit", conference: true, state: "ringing",
+    participantJoinedAt: {}, participantLeftAt: {},
+    invitedByParticipant: Object.fromEntries(participantIds
+      .filter((userId) => userId !== account(ws.userId))
+      .map((userId) => [userId, account(ws.userId)])),
+    createdAt: Date.now(), ringingAt: Date.now(), connectedAt: null,
+    endedAt: null, updatedAt: Date.now() };
+  calls.set(callId, call);
+  for (const userId of participantIds) {
+    if (userId === ws.userId) continue;
+    const event = { type: "call_invite", engine: "livekit", callId, chatId,
+      callerId: ws.userId, senderId: ws.userId, receiverId: userId,
+      mediaType, callMode: "group", participantIds: [...participantIds],
+      serverTime: Date.now() };
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, event);
+    if (!isUserViewingChat(userId, chatId)) {
+      sendCallNotification({ receiverId: userId, call }).catch((error) =>
+        console.error("Could not send group call notification:", error.message));
+    }
+  }
+  sendJson(ws, { type: "call_invite_ack", engine: "livekit", callId,
+    state: call.state, serverTime: Date.now() });
+  scheduleCallingTimeout(callId, sendJson);
+  return true;
+}
+
+async function handleLiveKitRelay(ws, payload, call, sendJson) {
+  const type = payload.type;
+  if (type === "call_answer" && !call.connectedAt) {
+    call.connectedAt = Date.now();
+    call.state = "connected";
+    call.updatedAt = call.connectedAt;
+    call.participantJoinedAt = call.participantJoinedAt || {};
+    call.participantJoinedAt[account(call.callerId)] = call.connectedAt;
+    console.log(`[call-connection] phase=livekit_connected callId=${call.callId}`
+      + ` chatId=${call.chatId} answeredBy=${ws.userId}`
+      + ` participants=${call.participantIds.length} setupMs=${call.connectedAt - call.createdAt}`);
+  }
+  if (type === "call_answer") {
+    call.participantJoinedAt = call.participantJoinedAt || {};
+    if (!call.participantJoinedAt[account(ws.userId)]) {
+      call.participantJoinedAt[account(ws.userId)] = Date.now();
+    }
+    call.joinedParticipantIds = [...new Set([
+      ...(call.joinedParticipantIds || [call.callerId]), account(ws.userId),
+    ])];
+  }
+  const endForEveryone = payload.reason === "end_for_everyone";
+  const twoParty = !call.conference && call.participantIds.length <= 2;
+  const conferenceLeave = call.conference && !endForEveryone
+      && (type === "call_end" || type === "call_leave" || type === "call_reject");
+  if ((!call.conference && type === "call_end")
+      || (type === "call_reject" && twoParty) || endForEveryone) {
+    call.state = type === "call_reject" ? "rejected" : "ended";
+    call.endedAt = Date.now();
+    call.updatedAt = call.endedAt;
+    call.terminationReason = type === "call_reject" ? "rejected"
+      : string(payload.reason) || "hangup";
+  } else if (conferenceLeave || type === "call_leave" || type === "call_reject") {
+    call.participantLeftAt = call.participantLeftAt || {};
+    call.participantLeftAt[account(ws.userId)] = Date.now();
+    call.participantIds = call.participantIds.filter((id) => id !== account(ws.userId));
+    call.joinedParticipantIds = (call.joinedParticipantIds || [])
+      .filter((id) => id !== account(ws.userId));
+    call.updatedAt = Date.now();
+    if (call.connectedAt && call.joinedParticipantIds.length <= 1) {
+      call.state = "ended";
+      call.endedAt = call.updatedAt;
+      call.terminationReason = "last_participant_left";
+    }
+  }
+  let relayType = conferenceLeave ? "call_leave" : type;
+  if (call.state === "ended" && (conferenceLeave || type === "call_leave"
+      || type === "call_reject")) relayType = "call_end";
+  const event = { ...payload, type: relayType, engine: "livekit", callId: call.callId,
+    callerId: call.callerId, senderId: ws.userId, mediaType: call.mediaType,
+    serverTime: Date.now() };
+  for (const userId of call.participantIds) {
+    if (userId === ws.userId) continue;
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, event);
+  }
+  sendJson(ws, { type: `${type}_ack`, engine: "livekit", callId: call.callId,
+    state: call.state, serverTime: Date.now() });
+  if (call.state === "ended") {
+    await finalizeCallMessage(call, sendJson);
+    await updateEndedCallNotification(call, !call.connectedAt);
+    notifyCallEnded(call);
+    setTimeout(() => calls.delete(call.callId), 30000);
+  } else if (call.state === "rejected") {
+    await finalizeCallMessage(call, sendJson);
+    await updateEndedCallNotification(call, false);
+    notifyCallEnded(call);
+    setTimeout(() => calls.delete(call.callId), 30000);
+  }
+  return true;
+}
+
 function deliverPendingCallsForUser(userId, sendJson) {
   const normalizedUserId = account(userId);
   cancelDisconnectGrace(normalizedUserId);
@@ -211,6 +411,18 @@ function deliverPendingCallsForUser(userId, sendJson) {
   const socket = getUserSocket(normalizedUserId);
   if (!socket) return;
   for (const call of calls.values()) {
+    if (call.engine === "livekit" && Array.isArray(call.participantIds)
+        && call.participantIds.includes(normalizedUserId)
+        && call.callerId !== normalizedUserId && !isTerminal(call.state)) {
+      const inviterId = account(call.invitedByParticipant?.[normalizedUserId]
+        || call.callerId);
+      sendJson(socket, { type: "call_invite", engine: "livekit", callId: call.callId,
+        chatId: call.chatId, callerId: inviterId, senderId: inviterId,
+        receiverId: normalizedUserId, mediaType: call.mediaType, callMode: "group",
+        participantIds: [...call.participantIds],
+        serverTime: Date.now() });
+      continue;
+    }
     if (call.receiverId !== normalizedUserId || call.state !== "calling"
         || call.suppressedForReceiver) continue;
     call.state = "ringing";
@@ -232,6 +444,9 @@ async function handleCallDisconnect(userId, sendJson) {
   console.log(`[call] signalingDisconnected userId=${disconnectedUserId} time=${Date.now()}`);
   for (const call of calls.values()) {
     if (!isParticipant(call, disconnectedUserId) || isTerminal(call.state)) continue;
+    // LiveKit owns group media reconnection; losing PingGo signaling must not end
+    // the room for every other participant.
+    if (call.engine === "livekit" && Array.isArray(call.participantIds)) continue;
     call.disconnectTimers = call.disconnectTimers || new Map();
     if (call.disconnectTimers.has(disconnectedUserId)) continue;
     const timer = setTimeout(async () => {
@@ -278,7 +493,7 @@ function sendInvite(call, socket, sendJson) {
     type: "call_invite", callId: call.callId, callerId: call.callerId,
     chatId: call.chatId,
     senderId: call.callerId, receiverId: call.receiverId, mediaType: call.mediaType,
-    sdp: call.offer, serverTime: Date.now(),
+    engine: call.engine || "legacy", sdp: call.offer, serverTime: Date.now(),
   });
 }
 
@@ -310,7 +525,9 @@ function scheduleCallingTimeout(callId, sendJson) {
 }
 
 function validateRelay(payload) {
-  if (payload.type === "call_answer" && !validDescription(payload.sdp, "answer")) return "Valid SDP answer is required.";
+  const call = calls.get(string(payload.callId));
+  if (payload.type === "call_answer" && call?.engine !== "livekit"
+      && !validDescription(payload.sdp, "answer")) return "Valid SDP answer is required.";
   if (payload.type === "ice_candidate") {
     const candidate = payload.candidate;
     if (!candidate || typeof candidate !== "object" || !string(candidate.candidate)) return "Valid ICE candidate is required.";
@@ -358,7 +575,14 @@ async function finalizeCallMessage(call, sendJson) {
     + ` connectedAt=${call.connectedAt || 0} endedAt=${call.endedAt}`
     + ` durationSeconds=${durationSeconds} terminationReason=${call.terminationReason || "unknown"}`
     + ` time=${finalizedAt}`);
-  const label = call.mediaType === "video" ? "Video Call" : "Voice Call";
+  const conference = Boolean(call.conference || call.chatId.startsWith("grp_")
+    || (Array.isArray(call.participantIds) && call.participantIds.length > 2));
+  const groupCall = call.chatId.startsWith("grp_");
+  const label = groupCall
+    ? (call.mediaType === "video" ? "Group Video Call" : "Group Voice Call")
+    : conference
+    ? (call.mediaType === "video" ? "Conference Video Call" : "Conference Voice Call")
+    : (call.mediaType === "video" ? "Video Call" : "Voice Call");
   const text = call.connectedAt
     ? `[${label}] ${formatDuration(durationSeconds)}` : `[${label}] missed`;
   const callerText = call.connectedAt ? text : `[${label}] didn't connect`;
@@ -366,15 +590,23 @@ async function finalizeCallMessage(call, sendJson) {
   try {
     const savedMessage = await saveCallMessage({ callId: call.callId, chatId: call.chatId,
       callerId: call.callerId, receiverId: call.receiverId, mediaType: call.mediaType,
+      conference, groupCall, participantIds: call.historyParticipantIds || call.participantIds,
+      participantInviterIds: call.invitedByParticipant || {},
+      participantJoinedAt: call.participantJoinedAt,
+      participantLeftAt: call.participantLeftAt,
       text, callerText, receiverText, durationSeconds,
       createdAt: call.createdAt, ringingAt: call.ringingAt,
       connectedAt: call.connectedAt, endedAt: call.endedAt,
       terminationReason: call.terminationReason || "unknown",
       suppressedForReceiver: Boolean(call.suppressedForReceiver) }, sendJson);
     const savedLog = await saveCallLog({ ...call, messageId: savedMessage.id });
-    for (const userId of [call.callerId, call.receiverId]) {
+    for (const userId of (call.historyParticipantIds || [call.callerId, call.receiverId])) {
       const socket = getUserSocket(userId);
-      if (socket) sendJson(socket, { type: "calls_list_updated", call: savedLog });
+      if (socket) sendJson(socket, { type: "calls_list_updated", call: {
+        ...savedLog,
+        durationSeconds: savedLog.participantDurationsSeconds?.[account(userId)]
+          ?? savedLog.durationSeconds,
+      } });
     }
   } catch (error) {
     call.messageSaved = false;
@@ -398,7 +630,11 @@ function hasActiveCall(userId) {
   for (const call of calls.values()) if (isParticipant(call, userId) && !isTerminal(call.state)) return true;
   return false;
 }
-function isParticipant(call, userId) { return call.callerId === userId || call.receiverId === userId; }
+function isParticipant(call, userId) {
+  return Array.isArray(call.participantIds)
+    ? call.participantIds.includes(account(userId))
+    : call.callerId === userId || call.receiverId === userId;
+}
 function isTerminal(state) { return state === "ended" || state === "rejected" || state === "busy"; }
 function cleanupExpiredCalls() {
   const cutoff = Date.now() - CALL_TTL_MS;
@@ -409,6 +645,10 @@ function canJoinMedia(callId, userId) {
   const call = calls.get(string(callId));
   return Boolean(call && call.mediaType === "video" && call.state === "connected" &&
     isParticipant(call, account(userId)));
+}
+function canJoinLiveKitCall(callId, userId) {
+  const call = calls.get(string(callId));
+  return Boolean(call && call.engine === "livekit" && isParticipant(call, account(userId)));
 }
 function getCallMediaInfo(callId) {
   const call = calls.get(string(callId));
@@ -452,4 +692,4 @@ function sdpHash(value) {
 }
 
 module.exports = { handleCallEvent, deliverPendingCallsForUser, handleCallDisconnect,
-  canJoinMedia, getCallMediaInfo, addCallEndedListener };
+  canJoinMedia, canJoinLiveKitCall, getCallMediaInfo, addCallEndedListener };

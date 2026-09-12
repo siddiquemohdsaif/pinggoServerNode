@@ -54,7 +54,11 @@ async function sendOfflineMessageNotification({ receiverId, message, group }) {
 
 async function sendCallNotification({ receiverId, call, missed = false }) {
   const fcmTokens = await getFcmTokens(receiverId);
-  if (fcmTokens.length === 0) return { success: false, skipped: true, reason: "Receiver FCM token is not available." };
+  if (fcmTokens.length === 0) {
+    console.warn(`[call-notification] phase=skipped callId=${call.callId}`
+      + ` receiver=${receiverId} reason=no_fcm_token`);
+    return { success: false, skipped: true, reason: "Receiver FCM token is not available." };
+  }
   const callerProfile = await getSenderProfile(call.callerId);
   const providerMessageIds = await sendToTokens(fcmTokens, {
     data: {
@@ -65,9 +69,22 @@ async function sendCallNotification({ receiverId, call, missed = false }) {
       callerName: callerProfile.name,
       profilePhotoUrl: callerProfile.profilePhotoUrl,
       mediaType: call.mediaType === "video" ? "video" : "audio",
+      engine: call.engine === "livekit" ? "livekit" : "legacy",
+      callMode: call.conference || (Array.isArray(call.participantIds)
+        && call.participantIds.length > 2) ? "group" : "direct",
+      participantIds: JSON.stringify(Array.isArray(call.participantIds)
+        ? call.participantIds : [call.callerId, call.receiverId].filter(Boolean)),
+      offerType: normalizeString(call.offer && call.offer.type),
+      offerDescription: normalizeString(call.offer && call.offer.description),
+      offerDescriptionBase64: normalizeString(
+        call.offer && call.offer.descriptionBase64),
     },
     android: { priority: "high", ttl: missed ? 24 * 60 * 60 * 1000 : 45 * 1000 },
   });
+  console.log(`[call-notification] phase=sent callId=${call.callId}`
+    + ` receiver=${receiverId} missed=${missed} tokens=${fcmTokens.length}`
+    + ` providerMessages=${providerMessageIds.length}`
+    + ` hasOffer=${Boolean(call.offer && (call.offer.descriptionBase64 || call.offer.description))}`);
   return { success: true, providerData: { messageIds: providerMessageIds } };
 }
 

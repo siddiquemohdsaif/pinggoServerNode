@@ -979,10 +979,28 @@ async function saveMessage(chatId, message) {
 }
 
 async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType, text,
-  callerText, receiverText,
-  durationSeconds, createdAt, ringingAt, connectedAt, endedAt, terminationReason,
-  suppressedForReceiver = false }, sendJson) {
-  if (!callId || !chatId || !callerId || !receiverId || !text) return null;
+    callerText, receiverText,
+    durationSeconds, createdAt, ringingAt, connectedAt, endedAt, terminationReason,
+    suppressedForReceiver = false, conference = false, groupCall = false,
+    participantIds = [], participantInviterIds = {},
+    participantJoinedAt = {}, participantLeftAt = {} }, sendJson) {
+  if (!callId || !chatId || !callerId || (!receiverId && !conference) || !text) return null;
+  const effectiveReceiver = receiverId || callerId;
+  // Conference participation does not grant membership in the original direct chat.
+  // Only real group calls fan the call message out to every participant.
+  const callParticipants = [...new Set((conference
+    ? participantIds : [callerId, effectiveReceiver]).map(normalizeAccountId).filter(Boolean))];
+  const recipients = [...new Set((groupCall
+    ? callParticipants : [callerId, effectiveReceiver])
+    .map(normalizeAccountId).filter(Boolean))];
+  const finalTime = Number(endedAt) || Date.now();
+  const participantDurationsSeconds = {};
+  for (const userId of callParticipants) {
+    const joinedAt = Number(participantJoinedAt && participantJoinedAt[userId]);
+    const leftAt = Number(participantLeftAt && participantLeftAt[userId]) || finalTime;
+    participantDurationsSeconds[userId] = joinedAt
+      ? Math.max(0, Math.floor((leftAt - joinedAt) / 1000)) : 0;
+  }
   const existingChat = await getChat(chatId);
   const existingMessage = existingChat && Object.values(existingChat).find((item) =>
     item && item.callId === callId &&
@@ -1001,44 +1019,130 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
   const sentTime = nextTimestamp();
   const message = {
     id: String(sentTime), clientMessageId: null, callId, chatId,
-    senderId: callerId, receiverId, text,
+      senderId: callerId, receiverId: effectiveReceiver, text,
     callerText: callerText || text, receiverText: receiverText || text,
     messageType: mediaType === "video" ? "video_call" : "voice_call",
     callDurationSeconds: durationSeconds, callCreatedAt: createdAt || null,
     callRingingAt: ringingAt || null, callConnectedAt: connectedAt || null,
-    callEndedAt: endedAt || null, callTerminationReason: terminationReason || "unknown",
+      callEndedAt: endedAt || null, callTerminationReason: terminationReason || "unknown",
+      conferenceCall: Boolean(conference), groupCall: Boolean(groupCall),
+      callParticipantIds: participantIds,
+      callParticipantDurationsSeconds: participantDurationsSeconds,
     sentTime, deliveredTime: null,
     readTime: null, status: "sent",
-    invisible: suppressedForReceiver ? [receiverId] : [],
-  };
-  await ensureChatReadyForMessage(
-    chatId, callerId, receiverId, !suppressedForReceiver,
-  );
+      invisible: suppressedForReceiver ? [effectiveReceiver] : [],
+    };
+    if (!chatId.startsWith("grp_")) await ensureChatReadyForMessage(
+      chatId, callerId, effectiveReceiver, !suppressedForReceiver);
   await saveMessage(chatId, message);
   if (suppressedForReceiver) {
     await updateLastMessage(callerId, chatId, {
       ...message, text: message.callerText || message.text,
     });
   } else {
-    await updateLastMessageForParticipants(message);
-  }
-  const receiverTotalUnread = suppressedForReceiver ? null
-    : await incrementUnreadCount(receiverId, chatId).catch(() => null);
-  const visibleUsers = suppressedForReceiver ? [callerId] : [callerId, receiverId];
+      await Promise.all(recipients.map((userId) => {
+        const ownDuration = participantDurationsSeconds[userId];
+        const personalizedText = conference && connectedAt && Number.isFinite(ownDuration)
+          ? String(message.text).replace(/\d+(?::\d+){1,2}$/,
+            formatCallDuration(ownDuration)) : null;
+        return updateLastMessage(userId, chatId, { ...message,
+          text: personalizedText
+            || (userId === callerId ? message.callerText : message.receiverText) });
+      }));
+    }
+    const unreadByUser = new Map();
+    if (!suppressedForReceiver) for (const userId of recipients) {
+      if (userId !== callerId) unreadByUser.set(userId,
+        await incrementUnreadCount(userId, chatId).catch(() => null));
+    }
+    const visibleUsers = suppressedForReceiver ? [callerId] : recipients;
   for (const userId of visibleUsers) {
+    const ownDuration = participantDurationsSeconds[userId];
+    const personalizedText = conference && connectedAt && Number.isFinite(ownDuration)
+      ? String(message.text).replace(/\d+(?::\d+){1,2}$/, formatCallDuration(ownDuration)) : null;
     const participantMessage = { ...message,
-      text: userId === callerId ? message.callerText : message.receiverText };
+      text: personalizedText || (userId === callerId ? message.callerText : message.receiverText) };
     sendToUser(userId, {
       type: "new_message",
       message: forStorage(participantMessage),
-      ...(userId === receiverId && receiverTotalUnread !== null
-        ? { total_unread: receiverTotalUnread }
+        ...(unreadByUser.has(userId) && unreadByUser.get(userId) !== null
+          ? { total_unread: unreadByUser.get(userId) }
         : {}),
     }, sendJson);
+  }
+  if (conference && !groupCall && !suppressedForReceiver) {
+    const originalParticipants = new Set([
+      normalizeAccountId(callerId), normalizeAccountId(effectiveReceiver),
+    ]);
+    const addedParticipants = callParticipants.filter(
+      (userId) => !originalParticipants.has(userId));
+    for (const participantId of addedParticipants) {
+      const inviterId = normalizeAccountId(participantInviterIds[participantId])
+        || normalizeAccountId(callerId);
+      if (!inviterId || inviterId === participantId) continue;
+      await saveConferenceMessageForAddedParticipant({
+        message, inviterId, participantId,
+        durationSeconds: participantDurationsSeconds[participantId],
+      }, sendJson);
+    }
   }
   // Call notifications are emitted by callHandler so completed calls never
   // appear as ordinary message notifications.
   return message;
+}
+
+async function saveConferenceMessageForAddedParticipant(
+    { message, inviterId, participantId, durationSeconds }, sendJson) {
+  const conferenceChatId = await findDirectChatId(inviterId, participantId)
+    || `${inviterId}_${participantId}`;
+  const existingChat = await getChat(conferenceChatId);
+  const existingMessage = existingChat && Object.values(existingChat).find((item) =>
+    item && item.callId === message.callId && item.messageType === message.messageType);
+  if (existingMessage) return;
+
+  const sentTime = nextTimestamp();
+  const participantText = message.callConnectedAt && Number.isFinite(durationSeconds)
+    ? String(message.receiverText || message.text).replace(/\d+(?::\d+){1,2}$/,
+      formatCallDuration(durationSeconds))
+    : message.receiverText || message.text;
+  const conferenceMessage = {
+    ...message,
+    id: String(sentTime),
+    chatId: conferenceChatId,
+    senderId: inviterId,
+    receiverId: participantId,
+    text: participantText,
+    callerText: participantText,
+    receiverText: participantText,
+    sentTime,
+  };
+  await ensureChatReadyForMessage(conferenceChatId, inviterId, participantId, true);
+  await saveMessage(conferenceChatId, conferenceMessage);
+  await Promise.all([
+    updateLastMessage(inviterId, conferenceChatId, conferenceMessage),
+    updateLastMessage(participantId, conferenceChatId, conferenceMessage),
+  ]);
+  const unread = await incrementUnreadCount(participantId, conferenceChatId).catch(() => null);
+  for (const userId of [inviterId, participantId]) {
+    sendToUser(userId, {
+      type: "new_message",
+      message: forStorage(conferenceMessage),
+      ...(userId === participantId && unread !== null ? { total_unread: unread } : {}),
+    }, sendJson);
+  }
+}
+
+async function findDirectChatId(firstUserId, secondUserId) {
+  const first = normalizeAccountId(firstUserId);
+  const second = normalizeAccountId(secondUserId);
+  const listDocument = await getChatsList(first);
+  const list = listDocument && listDocument.list;
+  const chatIds = Array.isArray(list) ? list : Object.keys(list || {});
+  return chatIds.find((chatId) => {
+    if (String(chatId).startsWith("grp_")) return false;
+    const members = String(chatId).split("_").map(normalizeAccountId);
+    return members.length === 2 && members.includes(first) && members.includes(second);
+  }) || "";
 }
 
 async function ensureChatReadyForMessage(chatId, senderId, receiverId, includeReceiver = true) {
@@ -1059,10 +1163,7 @@ async function createChatDocument(chatId) {
     await ensureShardedContainer("GroupsChat", chatId, "messages");
     return;
   }
-  await Promise.all([
-    ensureShardedContainer("Chats", chatId, "messages"),
-    ensureShardedContainer("CallLogs", chatId, "calls"),
-  ]);
+  await ensureShardedContainer("Chats", chatId, "messages");
 }
 
 async function addChatIdToChatsList(userId, chatId) {
@@ -1228,6 +1329,16 @@ function notifyMessageSenders({ chat, messageIds, payload, sendJson }) {
 
 function notifyMessageReceiver({ receiverId, payload, sendJson }) {
   sendToUser(normalizeAccountId(receiverId), payload, sendJson);
+}
+
+function formatCallDuration(totalSeconds) {
+  const seconds = Math.max(0, Number(totalSeconds) || 0);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = Math.floor(seconds % 60);
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
 }
 
 function sendMessageFailed(ws, sendJson, payload) {

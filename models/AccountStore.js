@@ -24,10 +24,7 @@ async function ensureListDocument(collection, accountId) {
 async function ensureAccountCollections(accountId) {
   const normalized = String(accountId || "").trim().replace(/^<plus>/, "").replace(/^\+/, "");
   if (!normalized) throw new Error("accountId is required.");
-  await Promise.all([
-    ensureListDocument("ChatsList", normalized),
-    ensureListDocument("CallsList", normalized),
-  ]);
+  await ensureListDocument("ChatsList", normalized);
 }
 
 module.exports = { ensureAccountCollections };

@@ -8,7 +8,7 @@ const RETRY_BASE_DELAY_MS = Math.max(100, Number(process.env.CLEAN_DB_RETRY_DELA
 
 // Keep this list synchronized with the collections used by routes/, realtime/, models/, and utils/.
 // Chats/GroupsChat store message batches in nested MessageBatches and metadata documents.
-// CallsList contains each user's latest call per chat; CallLogs contains history by chatId.
+// CallsList is retained only for legacy-data cleanup; CallLogs stores history by account id.
 // LinkedDevices and DeviceLinkRequests contain account sessions and pending pairing state.
 // DeletedAccounts contains deletion/re-registration lifecycle markers and former direct-chat links.
 // ChatAttachments contains metadata only; this script does not delete uploaded files from disk/storage.
