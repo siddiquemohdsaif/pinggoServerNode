@@ -204,6 +204,45 @@ async function upsertShardedEntries(rootCollection, rootId, entries, kind = "mes
   finally { if (locks.get(key) === operation) locks.delete(key); }
 }
 
+async function deleteShardedEntries(rootCollection, rootId, entryIds, kind = "messages") {
+  const ids = [...new Set((entryIds || []).map(String).filter(Boolean))];
+  if (!ids.length) return { deletedIds: [] };
+  const key = `${rootCollection}/${rootId}/${kind}`;
+  const previous = locks.get(key) || Promise.resolve();
+  const operation = previous.catch(() => null).then(async () => {
+    const state = await readState(rootCollection, rootId, kind);
+    const deletedIds = [];
+    for (const entryId of ids) {
+      for (const [documentId, document] of Object.entries(state.documents)) {
+        if (!Object.prototype.hasOwnProperty.call(document, entryId)) continue;
+        await firestore.deleteField(state.collection, state.parent, documentId, entryId);
+        delete document[entryId];
+        deletedIds.push(entryId);
+        break;
+      }
+    }
+    if (deletedIds.length) {
+      const batches = state.index.batches.map((metadata) => ({
+        ...metadata,
+        count: Object.keys(state.documents[metadata.id] || {}).length,
+        estimatedBytes: estimatedBytes(state.documents[metadata.id] || {}),
+      }));
+      await upsert(META_COLLECTION, INDEX_DOCUMENT, state.parent, {
+        batches,
+        batchIds: batches.map((item) => item.id),
+        currentBatch: state.index.currentBatch,
+        maxEntries: MAX_ENTRIES,
+        maxEstimatedBytes: MAX_ESTIMATED_BYTES,
+        updatedAt: Date.now(),
+      });
+    }
+    return { deletedIds };
+  });
+  locks.set(key, operation);
+  try { return await operation; }
+  finally { if (locks.get(key) === operation) locks.delete(key); }
+}
+
 async function deleteShardCollections(rootCollection, rootId) {
   const parent = parentPath(rootCollection, rootId);
   for (const collection of ["MessageBatches", "CallBatches", META_COLLECTION]) {
@@ -217,6 +256,7 @@ module.exports = {
   MAX_ENTRIES,
   MAX_ESTIMATED_BYTES,
   deleteShardCollections,
+  deleteShardedEntries,
   ensureShardedContainer,
   readShardedMap,
   upsertShardedEntries,

@@ -1,6 +1,6 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { callLogForStorage, callLogForClient } = require("../utils/specializedRecords");
-const { readShardedMap, upsertShardedEntries } = require("./ShardedDocumentStore");
+const { deleteShardedEntries, readShardedMap, upsertShardedEntries } = require("./ShardedDocumentStore");
 
 const firestore = FirestoreManager.getInstance();
 const LIST_COLLECTION = "CallsList";
@@ -159,4 +159,41 @@ async function getCallLogs(userId, chatId, pageSize, cursor) {
   return pageCalls(values, pageSize, cursor, "callId");
 }
 
-module.exports = { getCallsList, getCallLogs, saveCallLog };
+async function deleteCallLogs(userId, callIds) {
+  const id = normalizeId(userId);
+  const requested = [...new Set((callIds || []).map(String).filter(Boolean))];
+  if (!id || !requested.length) {
+    const error = new Error("At least one callId is required.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const timeline = await readUserTimeline(id);
+  const deleted = [];
+  for (const callId of requested) {
+    const stored = timeline.get(callId);
+    if (!stored) continue;
+    const log = callLogForClient(stored);
+    const messages = await readShardedMap("Chats", log.chatId, "messages");
+    const messageId = String(log.messageId || "");
+    const existing = messages && (messages[messageId]
+      || Object.values(messages).find((message) => String(message?.callId || "") === callId));
+    let tombstone = null;
+    if (existing) {
+      const resolvedMessageId = String(existing.id || messageId);
+      tombstone = {
+        ...existing,
+        deletedText: existing.deletedText == null ? existing.text : existing.deletedText,
+        text: "Call log was deleted",
+        deletedTime: Date.now(),
+        callLogDeleted: true,
+      };
+      await upsertShardedEntries("Chats", log.chatId,
+        { [resolvedMessageId]: tombstone }, "messages");
+    }
+    await deleteShardedEntries(LOG_COLLECTION, id, [callId], "calls");
+    deleted.push({ callId, chatId: log.chatId, messageId, message: tombstone });
+  }
+  return { deleted, deletedCallIds: deleted.map((item) => item.callId) };
+}
+
+module.exports = { deleteCallLogs, getCallsList, getCallLogs, saveCallLog };

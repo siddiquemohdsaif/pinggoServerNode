@@ -4,21 +4,15 @@ require("dotenv").config();
 
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { deleteFile } = require("../utils/fileStorage");
+const { deleteShardCollections } = require("../models/ShardedDocumentStore");
 
 const firestoreManager = FirestoreManager.getInstance();
+const DEMO_GENERATOR = "test/test1.js";
 
-// This allow-list prevents the cleanup from deleting an arbitrary account.
-const DEMO_PHONE_NUMBERS = Object.freeze([
-  "919766391481",
-  "918034033014",
-  "917103145905",
-  "916285982823",
-  "919077739548",
-  "919687748723",
-  "919259402853",
-  "918588407323",
-  "918755291604",
-  "917065082547",
+// Add specific test accounts here when they must be removed even if they were
+// created before test1 started marking generated accounts. Never add real users.
+const PHONE_NUMBERS_TO_DELETE = Object.freeze([
+  "923762276510"
 ]);
 
 function withoutId(document) {
@@ -52,6 +46,19 @@ async function deleteDocumentIfPresent(collection, documentId) {
   return true;
 }
 
+async function findDemoPhoneNumbers() {
+  const discovered = new Set(PHONE_NUMBERS_TO_DELETE);
+  const userIds = await firestoreManager.readCollectionDocumentIds("Users", "/");
+  for (const userId of userIds) {
+    const user = await readDocumentOrNull("Users", userId);
+    if (user && user.profileData
+        && user.profileData.demoGeneratedBy === DEMO_GENERATOR) {
+      discovered.add(String(userId));
+    }
+  }
+  return [...discovered];
+}
+
 async function removeChatFromParticipant(chatId, phoneNumber, deletedUsers) {
   if (deletedUsers.has(phoneNumber)) return;
 
@@ -78,10 +85,10 @@ async function removeChatFromParticipant(chatId, phoneNumber, deletedUsers) {
   });
 }
 
-async function findAllDemoChatIds() {
+async function findAllDemoChatIds(demoPhoneNumbers) {
   const chatIds = new Set();
 
-  for (const phoneNumber of DEMO_PHONE_NUMBERS) {
+  for (const phoneNumber of demoPhoneNumbers) {
     const chatsList = await readDocumentOrNull("ChatsList", phoneNumber);
     const storedList = chatsList && chatsList.list;
     const list = Array.isArray(storedList)
@@ -98,7 +105,7 @@ async function findAllDemoChatIds() {
   // Also catches a chat whose demo user's ChatsList document is already missing.
   const allChatIds = await firestoreManager.readCollectionDocumentIds("Chats", "/");
   for (const chatId of allChatIds) {
-    if (chatParticipants(chatId).some((id) => DEMO_PHONE_NUMBERS.includes(id))) {
+    if (chatParticipants(chatId).some((id) => demoPhoneNumbers.includes(id))) {
       chatIds.add(chatId);
     }
   }
@@ -106,7 +113,7 @@ async function findAllDemoChatIds() {
   return chatIds;
 }
 
-async function deleteMatchingAttachments(chatIds) {
+async function deleteMatchingAttachments(chatIds, demoPhoneNumbers) {
   const attachmentIds = await firestoreManager.readCollectionDocumentIds(
     "ChatAttachments",
     "/",
@@ -119,7 +126,7 @@ async function deleteMatchingAttachments(chatIds) {
 
     const belongsToCleanup =
       chatIds.has(attachment.chatId) ||
-      DEMO_PHONE_NUMBERS.includes(String(attachment.uploaderId || ""));
+      demoPhoneNumbers.includes(String(attachment.uploaderId || ""));
     if (!belongsToCleanup) continue;
 
     if (attachment.fullPath) {
@@ -135,11 +142,17 @@ async function deleteMatchingAttachments(chatIds) {
 async function deleteDemoUser(phoneNumber) {
   const user = await readDocumentOrNull("Users", phoneNumber);
   const pId = user && user.profileData && user.profileData.P_ID;
+  const profilePhotoUrl = user && user.profileData && user.profileData.profilePhotoUrl;
+  const profilePath = managedFilePath(profilePhotoUrl);
+
+  await deleteShardCollections("CallLogs", phoneNumber);
 
   const deleted = {
     phoneNumber,
     user: await deleteDocumentIfPresent("Users", phoneNumber),
     chatsList: await deleteDocumentIfPresent("ChatsList", phoneNumber),
+    callLogs: await deleteDocumentIfPresent("CallLogs", phoneNumber),
+    profileFile: profilePath ? Boolean(await deleteFile(profilePath)) : false,
     pId: false,
   };
 
@@ -150,9 +163,36 @@ async function deleteDemoUser(phoneNumber) {
   return deleted;
 }
 
+function managedFilePath(value) {
+  const marker = "/files/";
+  const text = String(value || "");
+  const index = text.indexOf(marker);
+  if (index < 0) return "";
+  try { return decodeURIComponent(text.slice(index + marker.length).split(/[?#]/)[0]); }
+  catch (_error) { return ""; }
+}
+
+async function removeMatchingCallLogs(accountId, chatIds) {
+  const parent = `/CallLogs/${accountId}`;
+  const batchIds = await firestoreManager.readCollectionDocumentIds("CallBatches", parent)
+    .catch(() => []);
+  let removed = 0;
+  for (const batchId of batchIds) {
+    const batch = await firestoreManager.readDocument("CallBatches", batchId, parent)
+      .catch(() => null);
+    for (const [callId, log] of Object.entries(batch || {})) {
+      if (callId === "_id" || !log || !chatIds.has(String(log.chatId || ""))) continue;
+      await firestoreManager.deleteField("CallBatches", parent, batchId, callId);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
 async function startExecution() {
-  const deletedUsers = new Set(DEMO_PHONE_NUMBERS);
-  const chatIds = await findAllDemoChatIds();
+  const demoPhoneNumbers = await findDemoPhoneNumbers();
+  const deletedUsers = new Set(demoPhoneNumbers);
+  const chatIds = await findAllDemoChatIds(demoPhoneNumbers);
 
   console.log(`Found ${chatIds.size} chat(s) belonging to the demo users.`);
 
@@ -163,35 +203,45 @@ async function startExecution() {
     }
   }
 
-  const deletedAttachments = await deleteMatchingAttachments(chatIds);
+  const deletedAttachments = await deleteMatchingAttachments(chatIds, demoPhoneNumbers);
+
+  const remainingParticipants = new Set([...chatIds]
+    .flatMap((chatId) => chatParticipants(chatId))
+    .filter((participant) => !deletedUsers.has(participant)));
+  let deletedPeerCallLogs = 0;
+  for (const participant of remainingParticipants) {
+    deletedPeerCallLogs += await removeMatchingCallLogs(participant, chatIds);
+  }
 
   let deletedChats = 0;
   for (const chatId of chatIds) {
+    await deleteShardCollections("Chats", chatId);
     if (await deleteDocumentIfPresent("Chats", chatId)) deletedChats += 1;
   }
 
   const users = [];
-  for (let index = 0; index < DEMO_PHONE_NUMBERS.length; index += 1) {
-    const phoneNumber = DEMO_PHONE_NUMBERS[index];
+  for (let index = 0; index < demoPhoneNumbers.length; index += 1) {
+    const phoneNumber = demoPhoneNumbers[index];
     const result = await deleteDemoUser(phoneNumber);
     users.push(result);
     console.log(
-      `[${index + 1}/${DEMO_PHONE_NUMBERS.length}] ${phoneNumber}` +
-        ` -> user=${result.user}, chatList=${result.chatsList}, pId=${result.pId}`,
+      `[${index + 1}/${demoPhoneNumbers.length}] ${phoneNumber}` +
+        ` -> user=${result.user}, chatList=${result.chatsList}, callLogs=${result.callLogs}, pId=${result.pId}`,
     );
   }
 
   const summary = {
-    requestedUsers: DEMO_PHONE_NUMBERS.length,
+    requestedUsers: demoPhoneNumbers.length,
     deletedChats,
     deletedAttachments,
+    deletedPeerCallLogs,
     users,
   };
   console.log("Cleanup completed:", JSON.stringify(summary, null, 2));
   return summary;
 }
 
-module.exports = { DEMO_PHONE_NUMBERS, startExecution };
+module.exports = { PHONE_NUMBERS_TO_DELETE, startExecution };
 
 if (require.main === module) {
   startExecution().catch((error) => {

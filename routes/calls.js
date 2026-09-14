@@ -1,5 +1,5 @@
 const express = require("express");
-const { getCallsList, getCallLogs } = require("../models/CallLogStore");
+const { deleteCallLogs, getCallsList, getCallLogs } = require("../models/CallLogStore");
 const { createParticipantToken, isLiveKitConfigured, missingLiveKitVariables } = require("../services/livekitService");
 const groupService = require("../services/groupService");
 const { canJoinLiveKitCall } = require("../realtime/callHandler");
@@ -82,6 +82,20 @@ router.post("/logs", async (req, res) => {
       phoneNumber, chatId, req.body.pageSize, req.body.cursor,
     );
     return res.json({ success: true, ...page });
+  } catch (error) {
+    return res.status(error.statusCode || 500)
+      .json({ success: false, message: error.message });
+  }
+});
+
+router.post("/logs/delete", async (req, res) => {
+  try {
+    const phoneNumber = String(req.auth && req.auth.userId || "")
+      .trim().replace(/^<plus>/, "").replace(/^\+/, "");
+    const callIds = Array.isArray(req.body.callIds)
+      ? req.body.callIds : [req.body.callId].filter(Boolean);
+    const result = await deleteCallLogs(phoneNumber, callIds);
+    return res.json({ success: true, ...result });
   } catch (error) {
     return res.status(error.statusCode || 500)
       .json({ success: false, message: error.message });

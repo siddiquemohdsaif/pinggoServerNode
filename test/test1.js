@@ -14,47 +14,219 @@ const { saveCallLog } = require("../models/CallLogStore");
 const AES = require("../utils/AES_256");
 
 const firestoreManager = FirestoreManager.getInstance();
-const TARGET_PHONE_NUMBER = "919867400865";
+const TARGET_PHONE_NUMBER = "919867180719";
 const DEMO_ASSET_DIRECTORY = process.env.DEMO_ASSET_DIRECTORY || "D:\\Temp";
+const MINIMUM_CHAT_COUNT = 1;
+const MAXIMUM_CHAT_COUNT = 100;
+const DEFAULT_CHAT_COUNT = 1;
 const MINIMUM_MESSAGE_COUNT = 1;
 const MAXIMUM_MESSAGE_COUNT = 10_000;
-const DEFAULT_MESSAGE_COUNT = 100;
+const DEFAULT_MIN_MESSAGE_COUNT = 1;
+const DEFAULT_MAX_MESSAGE_COUNT = 100;
+const DEMO_GENERATOR = "test/test1.js";
 const MESSAGE_TYPES = Object.freeze(Object.keys(MESSAGE_TYPE_CODES));
-const FIRST_NAMES = ["Aarav", "Aditi", "Amelia", "Carlos", "Chen", "Daniel", "Elena", "Fatima", "Hana", "James", "Lucas", "Mateo", "Meera", "Noah", "Olivia", "Sofia", "Yuki"];
-const LAST_NAMES = ["Anderson", "Costa", "Dubois", "Garcia", "Gupta", "Hassan", "Ivanov", "Kim", "Martin", "Miller", "Nakamura", "Patel", "Rossi", "Silva", "Singh", "Wang"];
+const FIRST_NAMES = [
+  "Aarav",
+  "Aditi",
+  "Amelia",
+  "Carlos",
+  "Chen",
+  "Daniel",
+  "Elena",
+  "Fatima",
+  "Hana",
+  "James",
+  "Lucas",
+  "Mateo",
+  "Meera",
+  "Noah",
+  "Olivia",
+  "Sofia",
+  "Yuki",
+];
+const LAST_NAMES = [
+  "Anderson",
+  "Costa",
+  "Dubois",
+  "Garcia",
+  "Gupta",
+  "Hassan",
+  "Ivanov",
+  "Kim",
+  "Martin",
+  "Miller",
+  "Nakamura",
+  "Patel",
+  "Rossi",
+  "Silva",
+  "Singh",
+  "Wang",
+];
 
 // Phone numbers are stored in the same digits-only E.164 form used by Pinggo.
 // Each template has a real country calling code and a plausible mobile prefix.
 const COUNTRY_PHONE_FORMATS = Object.freeze([
-  { countryName: "Argentina", countryIsoCode: "AR", countryCallingCode: "54", template: "54911########" },
-  { countryName: "Australia", countryIsoCode: "AU", countryCallingCode: "61", template: "614########" },
-  { countryName: "Bangladesh", countryIsoCode: "BD", countryCallingCode: "880", template: "8801#########" },
-  { countryName: "Brazil", countryIsoCode: "BR", countryCallingCode: "55", template: "55119########" },
-  { countryName: "Canada", countryIsoCode: "CA", countryCallingCode: "1", template: "1416#######" },
-  { countryName: "China", countryIsoCode: "CN", countryCallingCode: "86", template: "8613#########" },
-  { countryName: "Egypt", countryIsoCode: "EG", countryCallingCode: "20", template: "2010########" },
-  { countryName: "France", countryIsoCode: "FR", countryCallingCode: "33", template: "336########" },
-  { countryName: "Germany", countryIsoCode: "DE", countryCallingCode: "49", template: "4915#########" },
-  { countryName: "India", countryIsoCode: "IN", countryCallingCode: "91", template: "919#########" },
-  { countryName: "Indonesia", countryIsoCode: "ID", countryCallingCode: "62", template: "62812########" },
-  { countryName: "Italy", countryIsoCode: "IT", countryCallingCode: "39", template: "3934########" },
-  { countryName: "Japan", countryIsoCode: "JP", countryCallingCode: "81", template: "8190########" },
-  { countryName: "Mexico", countryIsoCode: "MX", countryCallingCode: "52", template: "5255########" },
-  { countryName: "Nigeria", countryIsoCode: "NG", countryCallingCode: "234", template: "23480########" },
-  { countryName: "Pakistan", countryIsoCode: "PK", countryCallingCode: "92", template: "923#########" },
-  { countryName: "Philippines", countryIsoCode: "PH", countryCallingCode: "63", template: "639#########" },
-  { countryName: "Russia", countryIsoCode: "RU", countryCallingCode: "7", template: "79#########" },
-  { countryName: "Saudi Arabia", countryIsoCode: "SA", countryCallingCode: "966", template: "9665########" },
-  { countryName: "South Africa", countryIsoCode: "ZA", countryCallingCode: "27", template: "277########" },
-  { countryName: "South Korea", countryIsoCode: "KR", countryCallingCode: "82", template: "8210########" },
-  { countryName: "Spain", countryIsoCode: "ES", countryCallingCode: "34", template: "346########" },
-  { countryName: "Turkey", countryIsoCode: "TR", countryCallingCode: "90", template: "905#########" },
-  { countryName: "United Arab Emirates", countryIsoCode: "AE", countryCallingCode: "971", template: "9715########" },
-  { countryName: "United Kingdom", countryIsoCode: "GB", countryCallingCode: "44", template: "447#########" },
-  { countryName: "United States", countryIsoCode: "US", countryCallingCode: "1", template: "1202#######" },
+  {
+    countryName: "Argentina",
+    countryIsoCode: "AR",
+    countryCallingCode: "54",
+    template: "54911########",
+  },
+  {
+    countryName: "Australia",
+    countryIsoCode: "AU",
+    countryCallingCode: "61",
+    template: "614########",
+  },
+  {
+    countryName: "Bangladesh",
+    countryIsoCode: "BD",
+    countryCallingCode: "880",
+    template: "8801#########",
+  },
+  {
+    countryName: "Brazil",
+    countryIsoCode: "BR",
+    countryCallingCode: "55",
+    template: "55119########",
+  },
+  {
+    countryName: "Canada",
+    countryIsoCode: "CA",
+    countryCallingCode: "1",
+    template: "1416#######",
+  },
+  {
+    countryName: "China",
+    countryIsoCode: "CN",
+    countryCallingCode: "86",
+    template: "8613#########",
+  },
+  {
+    countryName: "Egypt",
+    countryIsoCode: "EG",
+    countryCallingCode: "20",
+    template: "2010########",
+  },
+  {
+    countryName: "France",
+    countryIsoCode: "FR",
+    countryCallingCode: "33",
+    template: "336########",
+  },
+  {
+    countryName: "Germany",
+    countryIsoCode: "DE",
+    countryCallingCode: "49",
+    template: "4915#########",
+  },
+  {
+    countryName: "India",
+    countryIsoCode: "IN",
+    countryCallingCode: "91",
+    template: "919#########",
+  },
+  {
+    countryName: "Indonesia",
+    countryIsoCode: "ID",
+    countryCallingCode: "62",
+    template: "62812########",
+  },
+  {
+    countryName: "Italy",
+    countryIsoCode: "IT",
+    countryCallingCode: "39",
+    template: "3934########",
+  },
+  {
+    countryName: "Japan",
+    countryIsoCode: "JP",
+    countryCallingCode: "81",
+    template: "8190########",
+  },
+  {
+    countryName: "Mexico",
+    countryIsoCode: "MX",
+    countryCallingCode: "52",
+    template: "5255########",
+  },
+  {
+    countryName: "Nigeria",
+    countryIsoCode: "NG",
+    countryCallingCode: "234",
+    template: "23480########",
+  },
+  {
+    countryName: "Pakistan",
+    countryIsoCode: "PK",
+    countryCallingCode: "92",
+    template: "923#########",
+  },
+  {
+    countryName: "Philippines",
+    countryIsoCode: "PH",
+    countryCallingCode: "63",
+    template: "639#########",
+  },
+  {
+    countryName: "Russia",
+    countryIsoCode: "RU",
+    countryCallingCode: "7",
+    template: "79#########",
+  },
+  {
+    countryName: "Saudi Arabia",
+    countryIsoCode: "SA",
+    countryCallingCode: "966",
+    template: "9665########",
+  },
+  {
+    countryName: "South Africa",
+    countryIsoCode: "ZA",
+    countryCallingCode: "27",
+    template: "277########",
+  },
+  {
+    countryName: "South Korea",
+    countryIsoCode: "KR",
+    countryCallingCode: "82",
+    template: "8210########",
+  },
+  {
+    countryName: "Spain",
+    countryIsoCode: "ES",
+    countryCallingCode: "34",
+    template: "346########",
+  },
+  {
+    countryName: "Turkey",
+    countryIsoCode: "TR",
+    countryCallingCode: "90",
+    template: "905#########",
+  },
+  {
+    countryName: "United Arab Emirates",
+    countryIsoCode: "AE",
+    countryCallingCode: "971",
+    template: "9715########",
+  },
+  {
+    countryName: "United Kingdom",
+    countryIsoCode: "GB",
+    countryCallingCode: "44",
+    template: "447#########",
+  },
+  {
+    countryName: "United States",
+    countryIsoCode: "US",
+    countryCallingCode: "1",
+    template: "1202#######",
+  },
 ]);
 
-function randomItem(items) { return items[crypto.randomInt(items.length)]; }
+function randomItem(items) {
+  return items[crypto.randomInt(items.length)];
+}
 function shuffle(items) {
   const result = [...items];
   for (let index = result.length - 1; index > 0; index -= 1) {
@@ -70,26 +242,142 @@ function buildRandomizedSequence(items, count) {
 }
 function validateMessageCount(value) {
   const count = Number(value);
-  if (!Number.isInteger(count) || count < MINIMUM_MESSAGE_COUNT || count > MAXIMUM_MESSAGE_COUNT) {
-    throw new RangeError(`Message count must be an integer from ${MINIMUM_MESSAGE_COUNT} through ${MAXIMUM_MESSAGE_COUNT}.`);
+  if (
+    !Number.isInteger(count) ||
+    count < MINIMUM_MESSAGE_COUNT ||
+    count > MAXIMUM_MESSAGE_COUNT
+  ) {
+    throw new RangeError(
+      `Message count must be an integer from ${MINIMUM_MESSAGE_COUNT} through ${MAXIMUM_MESSAGE_COUNT}.`,
+    );
   }
   return count;
 }
+function validateChatCount(value) {
+  const count = Number(value);
+  if (
+    !Number.isInteger(count) ||
+    count < MINIMUM_CHAT_COUNT ||
+    count > MAXIMUM_CHAT_COUNT
+  ) {
+    throw new RangeError(
+      `Chat count must be an integer from ${MINIMUM_CHAT_COUNT} through ${MAXIMUM_CHAT_COUNT}.`,
+    );
+  }
+  return count;
+}
+function readChatCount(args = process.argv.slice(2)) {
+  const index = args.findIndex(
+    (value) => value === "--chats" || value === "-c",
+  );
+  return validateChatCount(index < 0 ? DEFAULT_CHAT_COUNT : args[index + 1]);
+}
 function readMessageCount(args = process.argv.slice(2)) {
-  const index = args.findIndex((value) => value === "--messages" || value === "-m");
-  return validateMessageCount(index < 0 ? DEFAULT_MESSAGE_COUNT : args[index + 1]);
+  const index = args.findIndex(
+    (value) => value === "--messages" || value === "-m",
+  );
+  return index < 0 ? null : validateMessageCount(args[index + 1]);
+}
+function readMessageRange(args = process.argv.slice(2)) {
+  const exact = readMessageCount(args);
+  if (exact !== null) return { minimum: exact, maximum: exact };
+  const minimumIndex = args.findIndex((value) => value === "--min-messages");
+  const maximumIndex = args.findIndex((value) => value === "--max-messages");
+  const minimum = validateMessageCount(
+    minimumIndex < 0 ? DEFAULT_MIN_MESSAGE_COUNT : args[minimumIndex + 1],
+  );
+  const maximum = validateMessageCount(
+    maximumIndex < 0 ? DEFAULT_MAX_MESSAGE_COUNT : args[maximumIndex + 1],
+  );
+  if (minimum > maximum) {
+    throw new RangeError(
+      "Minimum message count cannot exceed maximum message count.",
+    );
+  }
+  return { minimum, maximum };
+}
+function randomMessageCount({ minimum, maximum }) {
+  return minimum === maximum ? minimum : crypto.randomInt(minimum, maximum + 1);
 }
 function publicUrl(publicPath) {
   const base = String(process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
   return base ? `${base}${publicPath}` : publicPath;
 }
+function apiBaseUrl() {
+  const configured =
+    process.env.TEST_API_BASE_URL || process.env.PUBLIC_BASE_URL;
+  if (configured) return String(configured).replace(/\/$/, "");
+  const port = process.env.PRODUCTION_TYPE === "release" ? 4100 : 4200;
+  return `http://127.0.0.1:${port}`;
+}
+function bearer(account) {
+  return `Bearer ${account.phoneNumber}_${account.credential}`;
+}
+async function responseJson(response, operation) {
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch (_error) {
+    throw new Error(
+      `${operation} returned invalid JSON (HTTP ${response.status}).`,
+    );
+  }
+  if (!response.ok || payload.success === false) {
+    throw new Error(
+      `${operation} failed (HTTP ${response.status}): ${payload.message || text || "Unknown error"}`,
+    );
+  }
+  return payload;
+}
+async function verifyDownload(url, expectedBuffer, label) {
+  const response = await fetch(url);
+  if (!response.ok)
+    throw new Error(
+      `${label} could not be fetched (HTTP ${response.status}): ${url}`,
+    );
+  const downloaded = Buffer.from(await response.arrayBuffer());
+  if (!downloaded.length)
+    throw new Error(`${label} fetched an empty file: ${url}`);
+  if (expectedBuffer && !downloaded.equals(expectedBuffer)) {
+    throw new Error(
+      `${label} fetched data does not match the uploaded file: ${url}`,
+    );
+  }
+  return downloaded.length;
+}
+function assetMimeType(asset, kind) {
+  const extension = path.extname(asset).toLowerCase();
+  const types = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+  };
+  return types[extension] || (kind === "image" ? "image/jpeg" : "video/mp4");
+}
 async function listFiles(directory) {
   const entries = await fs.readdir(directory, { withFileTypes: true });
-  return entries.filter((entry) => entry.isFile()).map((entry) => path.join(directory, entry.name));
+  return entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => path.join(directory, entry.name));
 }
 async function copyAsset(sourcePath, requestedPath, mimeType) {
-  const saved = await saveFile({ buffer: await fs.readFile(sourcePath), requestedPath, originalName: path.basename(sourcePath), mimeType });
-  return { ...saved, url: publicUrl(saved.publicPath), sha256: crypto.createHash("sha256").update(await fs.readFile(sourcePath)).digest("hex") };
+  const buffer = await fs.readFile(sourcePath);
+  const saved = await saveFile({
+    buffer,
+    requestedPath,
+    originalName: path.basename(sourcePath),
+    mimeType,
+  });
+  return {
+    ...saved,
+    url: publicUrl(saved.publicPath),
+    sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
+  };
 }
 async function prepareDemoAssets() {
   const [profiles, images, videos] = await Promise.all([
@@ -97,22 +385,26 @@ async function prepareDemoAssets() {
     listFiles(path.join(DEMO_ASSET_DIRECTORY, "image")),
     listFiles(path.join(DEMO_ASSET_DIRECTORY, "video")),
   ]);
-  if (!profiles.length || !images.length || !videos.length) throw new Error(`${DEMO_ASSET_DIRECTORY} must contain profile, image, and video files.`);
-  const profileSource = randomItem(profiles);
-  const [profile, image, video] = await Promise.all([
-    copyAsset(profileSource, "profile_photo/", path.extname(profileSource).toLowerCase() === ".jpg" ? "image/jpeg" : "image/png"),
-    copyAsset(randomItem(images), "demo/image/", "image/jpeg"),
-    copyAsset(randomItem(videos), "demo/video/", "video/mp4"),
-  ]);
-  return { profile, image, video };
+  if (!profiles.length || !images.length || !videos.length)
+    throw new Error(
+      `${DEMO_ASSET_DIRECTORY} must contain profile, image, and video files.`,
+    );
+  // Message attachments are uploaded later, after the one chat id is known, so
+  // their paths match the production chat-attachment layout.
+  return { profiles, images, videos };
 }
 function randomUppercase(length) {
   const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  return Array.from({ length }, () => letters[crypto.randomInt(letters.length)]).join("");
+  return Array.from(
+    { length },
+    () => letters[crypto.randomInt(letters.length)],
+  ).join("");
 }
 function createInternationalPhoneNumber() {
   const country = randomItem(COUNTRY_PHONE_FORMATS);
-  const phoneNumber = country.template.replace(/#/g, () => String(crypto.randomInt(10)));
+  const phoneNumber = country.template.replace(/#/g, () =>
+    String(crypto.randomInt(10)),
+  );
   return { ...country, phoneNumber };
 }
 async function createUniqueAccount(profilePhotoUrl) {
@@ -121,7 +413,13 @@ async function createUniqueAccount(profilePhotoUrl) {
     const { phoneNumber } = phone;
     if (phoneNumber === TARGET_PHONE_NUMBER) continue;
     let exists = false;
-    try { exists = Boolean(await firestoreManager.readDocument("Users", phoneNumber, "/")); } catch (_error) { /* missing */ }
+    try {
+      exists = Boolean(
+        await firestoreManager.readDocument("Users", phoneNumber, "/"),
+      );
+    } catch (_error) {
+      /* missing */
+    }
     if (exists) continue;
     const name = `${randomItem(FIRST_NAMES)} ${randomItem(LAST_NAMES)}`;
     const personalId = randomUppercase(9);
@@ -133,135 +431,419 @@ async function createUniqueAccount(profilePhotoUrl) {
       countryName: phone.countryName,
       countryIsoCode: phone.countryIsoCode,
       countryCallingCode: phone.countryCallingCode,
+      demoGeneratedBy: DEMO_GENERATOR,
     };
-    const user = new UserModel(phoneNumber, profileData, AES.getEncryptedCredential(phoneNumber, personalId));
-    await firestoreManager.createDocument("P-ID-MAP", personalId, "/", { phoneNumber });
-    await firestoreManager.createDocument("Users", phoneNumber, "/", { ...user });
+    const user = new UserModel(
+      phoneNumber,
+      profileData,
+      AES.getEncryptedCredential(phoneNumber, personalId),
+    );
+    await firestoreManager.createDocument("P-ID-MAP", personalId, "/", {
+      phoneNumber,
+    });
+    await firestoreManager.createDocument("Users", phoneNumber, "/", {
+      ...user,
+    });
     await ensureAccountCollections(phoneNumber);
-    return { phoneNumber, name, personalId, countryName: phone.countryName, countryIsoCode: phone.countryIsoCode };
+    return {
+      phoneNumber,
+      name,
+      personalId,
+      countryName: phone.countryName,
+      countryIsoCode: phone.countryIsoCode,
+      credential: user.encryptedCredential,
+    };
   }
   throw new Error("Could not create a unique demo account.");
 }
 function defaultChatSettings() {
-  return { pinned: false, notification_muted: "0", archieved: false, unread_count: 0, last_message: null };
+  return {
+    pinned: false,
+    notification_muted: "0",
+    archieved: false,
+    unread_count: 0,
+    last_message: null,
+  };
 }
 async function addChatToList(phoneNumber, chatId, lastMessage) {
   let current = null;
-  try { current = await firestoreManager.readDocument("ChatsList", phoneNumber, "/"); } catch (_error) { /* missing */ }
+  try {
+    current = await firestoreManager.readDocument(
+      "ChatsList",
+      phoneNumber,
+      "/",
+    );
+  } catch (_error) {
+    /* missing */
+  }
   const stored = current?.list;
-  const list = Array.isArray(stored) ? Object.fromEntries(stored.map((id) => [id, defaultChatSettings()])) : stored && typeof stored === "object" ? stored : {};
-  const data = { list: { ...list, [chatId]: { ...defaultChatSettings(), ...(list[chatId] || {}), last_message: lastMessage } } };
-  if (current) await firestoreManager.updateDocument("ChatsList", phoneNumber, "/", data);
-  else await firestoreManager.createDocument("ChatsList", phoneNumber, "/", data);
+  const list = Array.isArray(stored)
+    ? Object.fromEntries(stored.map((id) => [id, defaultChatSettings()]))
+    : stored && typeof stored === "object"
+      ? stored
+      : {};
+  const data = {
+    list: {
+      ...list,
+      [chatId]: {
+        ...defaultChatSettings(),
+        ...(list[chatId] || {}),
+        last_message: lastMessage,
+      },
+    },
+  };
+  if (current)
+    await firestoreManager.updateDocument("ChatsList", phoneNumber, "/", data);
+  else
+    await firestoreManager.createDocument("ChatsList", phoneNumber, "/", data);
 }
-function baseMessage({ chatId, senderId, receiverId, messageType, sentTime, sequence }) {
+function baseMessage({
+  chatId,
+  senderId,
+  receiverId,
+  messageType,
+  sentTime,
+  sequence,
+}) {
   return {
     // Production messages use their millisecond timestamp as both the Firestore
     // entry key and message id. The generated timestamps below are already unique.
-    id: String(sentTime), clientMessageId: `demo-${crypto.randomUUID()}`, chatId, senderId, receiverId,
-    text: "", messageType, sentTime, deliveredTime: sentTime + 250, readTime: sentTime + 500,
-    status: "seen", invisible: [],
+    id: String(sentTime),
+    clientMessageId: `demo-${crypto.randomUUID()}`,
+    chatId,
+    senderId,
+    receiverId,
+    text: "",
+    messageType,
+    sentTime,
+    deliveredTime: sentTime + 250,
+    readTime: sentTime + 500,
+    status: "seen",
+    invisible: [],
   };
 }
-async function createAttachment({ chatId, senderId, messageId, messageType, asset, sentTime }) {
-  const mimeTypes = { image: "image/jpeg", video: "video/mp4", audio: "audio/mp4", file: "application/octet-stream" };
-  const attachment = {
-    id: crypto.randomUUID(), chatId, uploaderId: senderId, kind: messageType, name: asset.fileName,
-    mimeType: mimeTypes[messageType], size: asset.size, fullPath: asset.fullPath, url: asset.url,
-    status: "attached", createdTime: sentTime, completedTime: sentTime, messageId,
-    attachedTime: sentTime, sha256: asset.sha256, demo: true,
-  };
-  await firestoreManager.createDocument("ChatAttachments", attachment.id, "/", attachment);
+async function uploadProfilePhoto(account, asset) {
+  const source = await fs.readFile(asset);
+  const response = await fetch(`${apiBaseUrl()}/profile/uploadProfilePhoto`, {
+    method: "POST",
+    headers: {
+      Authorization: bearer(account),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ profilePhotoBase64: source.toString("base64") }),
+  });
+  const payload = await responseJson(response, "Profile photo upload");
+  await verifyDownload(payload.profilePhotoUrl, null, "Profile photo");
+  return payload.profilePhotoUrl;
+}
+async function createAttachment({
+  chatId,
+  senderId,
+  messageId,
+  messageType,
+  asset,
+  sentTime,
+  account,
+}) {
+  if (!["image", "video"].includes(messageType)) {
+    const mimeType =
+      messageType === "audio" ? "audio/mp4" : "application/octet-stream";
+    const attachmentId = crypto.randomUUID();
+    const saved = await copyAsset(
+      asset,
+      `chat_attachments/${chatId}/${attachmentId}-${path.basename(asset)}`,
+      mimeType,
+    );
+    const attachment = {
+      id: attachmentId,
+      chatId,
+      uploaderId: senderId,
+      kind: messageType,
+      name: path.basename(asset),
+      mimeType,
+      size: saved.size,
+      fullPath: saved.fullPath,
+      url: saved.url,
+      status: "attached",
+      createdTime: sentTime,
+      completedTime: sentTime,
+      messageId,
+      attachedTime: sentTime,
+      sha256: saved.sha256,
+      demo: true,
+    };
+    await firestoreManager.createDocument(
+      "ChatAttachments",
+      attachment.id,
+      "/",
+      attachment,
+    );
+    const { id, kind, name, size, url, sha256 } = attachment;
+    return { id, kind, name, mimeType, size, url, sha256 };
+  }
+  if (senderId !== account.phoneNumber)
+    throw new Error("Demo attachment sender must own its API credential.");
+  const buffer = await fs.readFile(asset);
+  const uploadMimeType = assetMimeType(asset, messageType);
+  const form = new FormData();
+  form.append("chatId", chatId);
+  form.append("kind", messageType);
+  form.append(
+    "file",
+    new Blob([buffer], { type: uploadMimeType }),
+    path.basename(asset),
+  );
+  const response = await fetch(`${apiBaseUrl()}/chats/attachments`, {
+    method: "POST",
+    headers: { Authorization: bearer(account) },
+    body: form,
+  });
+  const payload = await responseJson(
+    response,
+    `${messageType} attachment upload`,
+  );
+  const attachment = payload.attachment;
+  await verifyDownload(attachment.url, buffer, `${messageType} attachment`);
+  await firestoreManager.updateDocument("ChatAttachments", attachment.id, "/", {
+    ...attachment,
+    status: "attached",
+    messageId,
+    attachedTime: sentTime,
+    demo: true,
+  });
   const { id, kind, name, mimeType, size, url, sha256 } = attachment;
   return { id, kind, name, mimeType, size, url, sha256 };
 }
-async function createMessage({ chatId, senderId, receiverId, messageType, sentTime, sequence, assets }) {
-  const message = baseMessage({ chatId, senderId, receiverId, messageType, sentTime, sequence });
-  if (messageType === "text") message.text = `Demo text message ${sequence + 1}`;
+async function createMessage({
+  chatId,
+  senderId,
+  receiverId,
+  messageType,
+  sentTime,
+  sequence,
+  assets,
+  account,
+}) {
+  const message = baseMessage({
+    chatId,
+    senderId,
+    receiverId,
+    messageType,
+    sentTime,
+    sequence,
+  });
+  if (messageType === "text")
+    message.text = `Demo text message ${sequence + 1}`;
   if (["image", "video", "audio", "file"].includes(messageType)) {
     const asset = messageType === "image" ? assets.image : assets.video;
     message.text = `Demo ${messageType} attachment`;
-    message.attachment = await createAttachment({ chatId, senderId, messageId: message.id, messageType, asset, sentTime });
+    message.attachment = await createAttachment({
+      chatId,
+      senderId,
+      messageId: message.id,
+      messageType,
+      asset,
+      sentTime,
+      account,
+    });
   }
   if (messageType === "location") {
     message.text = "Demo location: New Delhi";
-    message.location = { latitude: 28.6139, longitude: 77.2090, accuracy: 10 };
+    message.location = { latitude: 28.6139, longitude: 77.209, accuracy: 10 };
   }
   if (messageType === "voice_call" || messageType === "video_call") {
-    const durationSeconds = 5 + sequence % 176;
+    const durationSeconds = 5 + (sequence % 176);
     const participantIds = [senderId, receiverId];
     Object.assign(message, {
-      clientMessageId: null, callId: crypto.randomUUID(),
-      text: messageType === "video_call" ? "Video Call" : "Voice Call", callDurationSeconds: durationSeconds,
-      callCreatedAt: sentTime - (durationSeconds + 3) * 1000, callRingingAt: sentTime - (durationSeconds + 2) * 1000,
-      callConnectedAt: sentTime - durationSeconds * 1000, callEndedAt: sentTime,
-      callTerminationReason: "hangup", callerText: "Outgoing call", receiverText: "Incoming call",
-      conferenceCall: false, groupCall: false, callParticipantIds: participantIds,
+      clientMessageId: null,
+      callId: crypto.randomUUID(),
+      text: messageType === "video_call" ? "Video Call" : "Voice Call",
+      callDurationSeconds: durationSeconds,
+      callCreatedAt: sentTime - (durationSeconds + 3) * 1000,
+      callRingingAt: sentTime - (durationSeconds + 2) * 1000,
+      callConnectedAt: sentTime - durationSeconds * 1000,
+      callEndedAt: sentTime,
+      callTerminationReason: "hangup",
+      callerText: "Outgoing call",
+      receiverText: "Incoming call",
+      conferenceCall: false,
+      groupCall: false,
+      callParticipantIds: participantIds,
       callParticipantDurationsSeconds: Object.fromEntries(
-        participantIds.map((participantId) => [participantId, durationSeconds])),
+        participantIds.map((participantId) => [participantId, durationSeconds]),
+      ),
     });
   }
-  if (messageType === "report") Object.assign(message, { text: "Message reported for demo testing", reportReason: "demo_report", reportedMessageId: "demo-reported-message" });
-  if (messageType === "chat_report") Object.assign(message, { text: "Chat reported for demo testing", reportReason: "demo_chat_report", reportedChatId: chatId });
+  if (messageType === "report")
+    Object.assign(message, {
+      text: "Message reported for demo testing",
+      reportReason: "demo_report",
+      reportedMessageId: "demo-reported-message",
+    });
+  if (messageType === "chat_report")
+    Object.assign(message, {
+      text: "Chat reported for demo testing",
+      reportReason: "demo_chat_report",
+      reportedChatId: chatId,
+    });
   if (messageType === "chat_block") message.text = "Chat blocked";
   if (messageType === "chat_unblock") message.text = "Chat unblocked";
-  if (messageType === "group_system") Object.assign(message, { text: "Demo member joined the group", groupSystemAction: "member_joined", affectedUserId: senderId });
+  if (messageType === "group_system")
+    Object.assign(message, {
+      text: "Demo member joined the group",
+      groupSystemAction: "member_joined",
+      affectedUserId: senderId,
+    });
   return message;
 }
-async function startExecution(options = {}) {
-  const messageCount = validateMessageCount(options.messageCount ?? readMessageCount());
-  if (messageCount < MESSAGE_TYPES.length) console.warn(`Coverage warning: ${messageCount} messages cannot contain all ${MESSAGE_TYPES.length} types. Use --messages ${MESSAGE_TYPES.length} or more.`);
-  const assets = await prepareDemoAssets();
-  const account = await createUniqueAccount(assets.profile.url);
+async function createDemoChat({ messageCount, assets }) {
+  const profileSource = randomItem(assets.profiles);
+  const account = await createUniqueAccount(null);
+  account.profilePhotoUrl = await uploadProfilePhoto(account, profileSource);
   const chatId = `${account.phoneNumber}_${TARGET_PHONE_NUMBER}`;
   const messageTypes = buildRandomizedSequence(MESSAGE_TYPES, messageCount);
   const now = Date.now();
   const messages = {};
   const callMessages = [];
   for (let index = 0; index < messageCount; index += 1) {
-    const outgoing = index % 2 === 0;
-    const message = await createMessage({ chatId, senderId: outgoing ? account.phoneNumber : TARGET_PHONE_NUMBER,
-      receiverId: outgoing ? TARGET_PHONE_NUMBER : account.phoneNumber, messageType: messageTypes[index],
-      sentTime: now - (messageCount - index) * 1000, sequence: index, assets });
+    const mediaMessage = ["image", "video"].includes(messageTypes[index]);
+    const outgoing = mediaMessage || index % 2 === 0;
+    const message = await createMessage({
+      chatId,
+      senderId: outgoing ? account.phoneNumber : TARGET_PHONE_NUMBER,
+      receiverId: outgoing ? TARGET_PHONE_NUMBER : account.phoneNumber,
+      messageType: messageTypes[index],
+      sentTime: now - (messageCount - index) * 1000,
+      sequence: index,
+      assets: {
+        image: randomItem(assets.images),
+        video: randomItem(assets.videos),
+      },
+      account,
+    });
     messages[message.id] = forStorage(message);
     if (message.callId) callMessages.push(message);
   }
   const writeResult = await upsertShardedEntries("Chats", chatId, messages);
-  const latestMessage = Object.values(messages).sort((a, b) => a.sentTime - b.sentTime).at(-1);
-  const latestForSender = { ...latestMessage,
-    text: latestMessage.callerText || latestMessage.text };
-  const latestForReceiver = { ...latestMessage,
-    text: latestMessage.receiverText || latestMessage.text };
+  const createdChatIds = new Set(
+    Object.values(messages).map((message) => message.chatId),
+  );
+  if (createdChatIds.size !== 1 || !createdChatIds.has(chatId))
+    throw new Error("Each demo account must create exactly one chat.");
+  const latestMessage = Object.values(messages)
+    .sort((a, b) => a.sentTime - b.sentTime)
+    .at(-1);
+  const latestForSender = {
+    ...latestMessage,
+    text: latestMessage.callerText || latestMessage.text,
+  };
+  const latestForReceiver = {
+    ...latestMessage,
+    text: latestMessage.receiverText || latestMessage.text,
+  };
   await Promise.all([
     addChatToList(latestMessage.senderId, chatId, latestForSender),
     addChatToList(latestMessage.receiverId, chatId, latestForReceiver),
-    ...callMessages.map((message) => saveCallLog({
-      callId: message.callId,
-      messageId: message.id,
-      chatId: message.chatId,
-      callerId: message.senderId,
-      receiverId: message.receiverId,
-      mediaType: message.messageType === "video_call" ? "video" : "audio",
-      state: "ended",
-      terminationReason: message.callTerminationReason,
-      createdAt: message.callCreatedAt,
-      ringingAt: message.callRingingAt,
-      connectedAt: message.callConnectedAt,
-      endedAt: message.callEndedAt,
-      participantIds: message.callParticipantIds,
-      historyParticipantIds: message.callParticipantIds,
-      participantJoinedAt: Object.fromEntries(message.callParticipantIds
-        .map((participantId) => [participantId, message.callConnectedAt])),
-      participantLeftAt: Object.fromEntries(message.callParticipantIds
-        .map((participantId) => [participantId, message.callEndedAt])),
-      conference: false,
-    })),
+    ...callMessages.map((message) =>
+      saveCallLog({
+        callId: message.callId,
+        messageId: message.id,
+        chatId: message.chatId,
+        callerId: message.senderId,
+        receiverId: message.receiverId,
+        mediaType: message.messageType === "video_call" ? "video" : "audio",
+        state: "ended",
+        terminationReason: message.callTerminationReason,
+        createdAt: message.callCreatedAt,
+        ringingAt: message.callRingingAt,
+        connectedAt: message.callConnectedAt,
+        endedAt: message.callEndedAt,
+        participantIds: message.callParticipantIds,
+        historyParticipantIds: message.callParticipantIds,
+        participantJoinedAt: Object.fromEntries(
+          message.callParticipantIds.map((participantId) => [
+            participantId,
+            message.callConnectedAt,
+          ]),
+        ),
+        participantLeftAt: Object.fromEntries(
+          message.callParticipantIds.map((participantId) => [
+            participantId,
+            message.callEndedAt,
+          ]),
+        ),
+        conference: false,
+      }),
+    ),
   ]);
   const includedTypes = [...new Set(messageTypes)];
-  console.log(`Created ${messageCount} messages and ${callMessages.length} per-user call logs in sharded chat ${chatId}.`);
-  console.log(`Included types: ${includedTypes.join(", ")}.`);
-  return { account, chatId, messageCount, messageTypes: includedTypes, writeResult };
+  console.log(
+    `Created chat ${chatId} with ${messageCount} messages, real attachment files, and ${callMessages.length} per-user call logs.`,
+  );
+  const { credential: _credential, ...publicAccount } = account;
+  return {
+    account: publicAccount,
+    chatId,
+    messageCount,
+    messageTypes: includedTypes,
+    callLogCount: callMessages.length,
+    writeResult,
+  };
 }
 
-module.exports = { COUNTRY_PHONE_FORMATS, MESSAGE_TYPES, buildRandomizedSequence, createInternationalPhoneNumber, createMessage, readMessageCount, startExecution };
-if (require.main === module) startExecution().catch((error) => { console.error("Demo execution failed:", error); process.exitCode = 1; });
+async function startExecution(options = {}) {
+  const chatCount = validateChatCount(options.chatCount ?? readChatCount());
+  const range =
+    options.messageCount != null
+      ? {
+          minimum: validateMessageCount(options.messageCount),
+          maximum: validateMessageCount(options.messageCount),
+        }
+      : options.minMessageCount != null || options.maxMessageCount != null
+        ? readMessageRange([
+            "--min-messages",
+            String(options.minMessageCount ?? DEFAULT_MIN_MESSAGE_COUNT),
+            "--max-messages",
+            String(options.maxMessageCount ?? DEFAULT_MAX_MESSAGE_COUNT),
+          ])
+        : readMessageRange();
+  const assets = await prepareDemoAssets();
+  const chats = [];
+  for (let index = 0; index < chatCount; index += 1) {
+    const messageCount = randomMessageCount(range);
+    if (messageCount < MESSAGE_TYPES.length)
+      console.warn(
+        `Coverage warning: chat ${index + 1} has ${messageCount} messages and cannot contain all ${MESSAGE_TYPES.length} types.`,
+      );
+    chats.push(await createDemoChat({ messageCount, assets }));
+  }
+  console.log(
+    `Created ${chats.length} chat(s) with message counts in the requested ${range.minimum}-${range.maximum} range.`,
+  );
+  return {
+    chatCount: chats.length,
+    messageCountRange: range,
+    chats,
+    // Preserve the original result fields for callers that create the default one chat.
+    ...(chats.length === 1 ? chats[0] : {}),
+  };
+}
+
+module.exports = {
+  COUNTRY_PHONE_FORMATS,
+  MESSAGE_TYPES,
+  MINIMUM_CHAT_COUNT,
+  buildRandomizedSequence,
+  createInternationalPhoneNumber,
+  createMessage,
+  randomMessageCount,
+  readChatCount,
+  readMessageCount,
+  readMessageRange,
+  startExecution,
+};
+if (require.main === module)
+  startExecution().catch((error) => {
+    console.error("Demo execution failed:", error);
+    process.exitCode = 1;
+  });
