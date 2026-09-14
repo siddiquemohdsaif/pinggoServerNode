@@ -141,9 +141,14 @@ router.post("/media", async (req, res) => {
     const chatId = normalizeString(req.body.chatId);
     const pageSize = Math.min(50, Math.max(1, Number(req.body.pageSize) || 20));
     const before = Number(req.body.before || Number.MAX_SAFE_INTEGER);
+    const category = normalizeString(req.body.category || "all").toLowerCase();
     const phoneError = validatePhoneNumber({ phoneNumber });
     if (phoneError || !chatId) return res.status(400).json({ success: false,
       message: phoneError || "chatId is required." });
+    if (!["all", "media", "docs", "links"].includes(category)) {
+      return res.status(400).json({ success: false,
+        message: "category must be all, media, docs, or links." });
+    }
     if (chatId.startsWith("grp_")) {
       const group = await groupService.readGroup(chatId);
       try { groupService.requireMember(group, phoneNumber); }
@@ -158,7 +163,12 @@ router.post("/media", async (req, res) => {
         const type = normalizeString(message.messageType).toLowerCase();
         const hasSupportedAttachment = message.attachment && ["image", "video", "file"].includes(type);
         const hasLink = /https?:\/\/[^\s]+/i.test(normalizeString(message.text));
-        return (hasSupportedAttachment || hasLink) && Number(message.sentTime) < before;
+        const matchesCategory = category === "media"
+          ? message.attachment && ["image", "video"].includes(type)
+          : category === "docs"
+            ? message.attachment && type === "file"
+            : category === "links" ? hasLink : hasSupportedAttachment || hasLink;
+        return matchesCategory && Number(message.sentTime) < before;
       })
       .sort(compareMessageSortEntries).slice(0, pageSize);
     return res.status(200).json({ success: true, media: media.map(forStorage),

@@ -6,7 +6,9 @@
     "test": "node --test test/*.test.js",
     "run": "node index.js",
     "migrate:sharded:dry-run": "node test/migrateShardedStorage.js",
-    "migrate:sharded": "node test/migrateShardedStorage.js --execute"
+    "migrate:sharded": "node test/migrateShardedStorage.js --execute",
+    "migrate:attachments:dry-run": "node test/migrateShardedAttachments.js",
+    "migrate:attachments": "node test/migrateShardedAttachments.js --execute"
   },
   "author": "",
   "license": "ISC",

@@ -3,6 +3,8 @@
 require("dotenv").config();
 
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { readShardedMap } = require("../models/ShardedDocumentStore");
+const { updateAttachment } = require("../models/ChatAttachmentStore");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -56,11 +58,25 @@ function buildMigrationPlan(chatId, chatDocument) {
 
 async function updateAttachmentReferences(plans) {
   const plansByChatId = new Map(plans.map((plan) => [plan.chatId, plan]));
+  let updated = 0;
+
+  // Current chat-scoped attachment batches.
+  for (const plan of plans) {
+    const attachments = await readShardedMap(
+      "ChatAttachments", plan.chatId, "attachments");
+    for (const [attachmentId, attachment] of Object.entries(attachments || {})) {
+      const newMessageId = plan.idMap.get(String(attachment.messageId || ""));
+      if (!newMessageId || newMessageId === attachment.messageId) continue;
+      await updateAttachment(plan.chatId, attachmentId, { messageId: newMessageId });
+      updated += 1;
+    }
+  }
+
+  // Previous flat attachment documents.
   const attachmentIds = await firestoreManager.readCollectionDocumentIds(
     "ChatAttachments",
     "/",
   );
-  let updated = 0;
 
   for (const attachmentId of attachmentIds) {
     let attachment;

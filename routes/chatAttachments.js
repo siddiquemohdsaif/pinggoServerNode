@@ -6,6 +6,8 @@ const fs = require("fs").promises;
 const AES = require("../utils/AES_256");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const groupService = require("../services/groupService");
+const { saveAttachment } = require("../models/ChatAttachmentStore");
+const { normalizeUploadedVideo } = require("../services/videoNormalizationService");
 const { deleteFile, maxFileSizeMb, resolveUploadPath, saveFile, uploadDir } = require("../utils/fileStorage");
 
 const router = express.Router();
@@ -156,6 +158,12 @@ router.post("/:uploadId/complete", async (req, res, next) => {
       throw statusError(400, "Attachment content does not match its declared type.");
     }
 
+    const videoMetadata = manifest.kind === "video"
+      ? await normalizeUploadedVideo(finalPath, manifest.mimeType) : null;
+    const stored = videoMetadata && videoMetadata.normalized
+      ? await inspectFile(finalPath) : inspected;
+    const storedStat = await fs.stat(finalPath);
+
     const publicPath = `/files/${relativePath.replace(/\\/g, "/")}`;
     const attachment = {
       id: manifest.attachmentId,
@@ -164,15 +172,16 @@ router.post("/:uploadId/complete", async (req, res, next) => {
       kind: manifest.kind,
       name: manifest.fileName,
       mimeType: manifest.mimeType,
-      size: assembledSize,
+      size: storedStat.size,
       fullPath: relativePath.replace(/\\/g, "/"),
       url: makeDownloadUrl(req, publicPath),
       status: "pending",
       createdTime: manifest.createdTime,
       completedTime: Date.now(),
-      sha256: fileHash,
+      sha256: stored.hash,
+      ...(videoMetadata ? { durationMs: videoMetadata.durationMs } : {}),
     };
-    await firestoreManager.createDocument(attachmentCollection(manifest.chatId), attachment.id, "/", { ...attachment });
+    await saveAttachment(manifest.chatId, attachment);
     const sessionDir = getChunkSessionDir(manifest.uploadId);
     await fs.writeFile(path.join(sessionDir, "completed.json"), JSON.stringify(attachment));
     await Promise.all(Array.from({ length: manifest.totalChunks }, (_, index) =>
@@ -231,6 +240,11 @@ router.post("/", upload.single("file"), async (req, res, next) => {
       originalName: req.file.originalname,
       mimeType: req.file.mimetype,
     });
+    const savedPath = resolveUploadPath(savedFile.fullPath);
+    const videoMetadata = kind === "video"
+      ? await normalizeUploadedVideo(savedPath, req.file.mimetype) : null;
+    const inspected = await inspectFile(savedPath);
+    const storedStat = await fs.stat(savedPath);
     const attachment = {
       id: attachmentId,
       chatId,
@@ -238,14 +252,15 @@ router.post("/", upload.single("file"), async (req, res, next) => {
       kind,
       name: req.file.originalname,
       mimeType: req.file.mimetype || "application/octet-stream",
-      size: req.file.size,
+      size: storedStat.size,
       fullPath: savedFile.fullPath,
       url: makeDownloadUrl(req, savedFile.publicPath),
       status: "pending",
       createdTime: Date.now(),
-      sha256: sha256(req.file.buffer),
+      sha256: inspected.hash,
+      ...(videoMetadata ? { durationMs: videoMetadata.durationMs } : {}),
     };
-    await firestoreManager.createDocument(attachmentCollection(chatId), attachmentId, "/", { ...attachment });
+    await saveAttachment(chatId, attachment);
     return res.status(201).json({ success: true, attachment });
   } catch (error) {
     if (savedFile) await deleteFile(savedFile.fullPath).catch(() => null);
@@ -266,10 +281,6 @@ async function isChatParticipant(chatId, uid) {
     return Boolean(groupService.activeMember(group, uid));
   }
   return chatId.split("_").map(normalizeId).includes(uid);
-}
-
-function attachmentCollection(chatId) {
-  return String(chatId || "").startsWith("grp_") ? "GroupAttachments" : "ChatAttachments";
 }
 
 function normalizeId(value) {

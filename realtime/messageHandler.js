@@ -7,6 +7,7 @@ const { nextTimestamp } = require("../utils/timestampId");
 const { ensureShardedContainer, readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { ensureAccountCollections } = require("../models/AccountStore");
 const { isAccountDeleted } = require("../services/accountDeletionService");
+const { readAttachment, updateAttachment } = require("../models/ChatAttachmentStore");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -103,7 +104,7 @@ async function handleSendMessage(ws, payload, sendJson) {
   let attachment = null;
   if (["image", "video", "audio", "file"].includes(messageType)) {
     try {
-      attachment = await firestoreManager.readDocument(attachmentCollection(chatId), attachmentId, "/");
+      attachment = await readAttachment(chatId, attachmentId);
     } catch (_error) {
       attachment = null;
     }
@@ -144,8 +145,8 @@ async function handleSendMessage(ws, payload, sendJson) {
       ...(attachmentHeight ? { height: attachmentHeight } : {}),
       ...(["portrait", "landscape"].includes(attachmentOrientation)
         ? { orientation: attachmentOrientation } : {}),
-      ...(messageType === "video" && attachmentDurationMs
-        ? { durationMs: attachmentDurationMs } : {}),
+      ...(messageType === "video" && (attachmentDurationMs || attachment.durationMs)
+        ? { durationMs: attachmentDurationMs || attachment.durationMs } : {}),
     };
   }
   if (messageType === "location") message.location = location;
@@ -166,9 +167,7 @@ async function handleSendMessage(ws, payload, sendJson) {
     if (attachment) {
       const updatedAttachment = { ...attachment, status: "attached", messageId, attachedTime: sentTime };
       delete updatedAttachment._id;
-      firestoreManager
-        .updateDocument(attachmentCollection(chatId), attachmentId, "/", updatedAttachment)
-        .catch(() => null);
+      updateAttachment(chatId, attachmentId, updatedAttachment).catch(() => null);
     }
     const receiverSockets = getUserSockets(receiverId);
     const receiverOnline = receiverSockets.length > 0;
@@ -1506,12 +1505,6 @@ function normalizeString(value) {
 
 function chatCollection(chatId) {
   return normalizeString(chatId).startsWith("grp_") ? "GroupsChat" : "Chats";
-}
-
-function attachmentCollection(chatId) {
-  return normalizeString(chatId).startsWith("grp_")
-    ? "GroupAttachments"
-    : "ChatAttachments";
 }
 
 function positiveInteger(value) {

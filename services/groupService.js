@@ -6,6 +6,7 @@ const { forStorage } = require("../utils/messageTypes");
 const { sendOfflineMessageNotification } = require("../realtime/fcmService");
 const { ensureShardedContainer, readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { ensureAccountCollections } = require("../models/AccountStore");
+const { readAttachment, updateAttachment } = require("../models/ChatAttachmentStore");
 
 const firestore = FirestoreManager.getInstance();
 const MAX_MEMBERS = 1024;
@@ -362,7 +363,7 @@ async function sendGroupMessage(ws, payload, sendJson) {
     let attachment = payload.attachment || null;
     const attachmentId = text(payload.attachmentId);
     if (!attachment && attachmentId) {
-      try { attachment = await firestore.readDocument("GroupAttachments", attachmentId, "/"); }
+      try { attachment = await readAttachment(groupId, attachmentId); }
       catch (_error) { attachment = null; }
       if (!attachment || attachment.chatId !== groupId || accountId(attachment.uploaderId) !== senderId ||
           attachment.status !== "pending" || attachment.kind !== messageType) {
@@ -382,9 +383,8 @@ async function sendGroupMessage(ws, payload, sendJson) {
     await ensureChat(groupId); await upsertShardedEntries("GroupsChat", groupId, {
       [message.id]: forStorage(message),
     });
-    if (attachmentId) await firestore.updateDocument("GroupAttachments", attachmentId, "/", {
-      ...withoutId(await firestore.readDocument("GroupAttachments", attachmentId, "/")), status: "used",
-      messageId: message.id, usedAt: sentTime,
+    if (attachmentId) await updateAttachment(groupId, attachmentId, {
+      status: "used", messageId: message.id, usedAt: sentTime,
     });
     await fanOutMessage(group, message, senderId);
     sendJson(ws, { type: "group_message_ack", clientMessageId, messageId: message.id, chatId: groupId,

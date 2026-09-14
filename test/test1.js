@@ -6,11 +6,12 @@ const fs = require("fs").promises;
 const path = require("path");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const UserModel = require("../models/UserModel");
-const { upsertShardedEntries } = require("../models/ShardedDocumentStore");
+const { readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { MESSAGE_TYPE_CODES, forStorage } = require("../utils/messageTypes");
 const { saveFile } = require("../utils/fileStorage");
 const { ensureAccountCollections } = require("../models/AccountStore");
 const { saveCallLog } = require("../models/CallLogStore");
+const { saveAttachment, updateAttachment } = require("../models/ChatAttachmentStore");
 const AES = require("../utils/AES_256");
 
 const firestoreManager = FirestoreManager.getInstance();
@@ -344,7 +345,7 @@ async function verifyDownload(url, expectedBuffer, label) {
       `${label} fetched data does not match the uploaded file: ${url}`,
     );
   }
-  return downloaded.length;
+  return downloaded;
 }
 function assetMimeType(asset, kind) {
   const extension = path.extname(asset).toLowerCase();
@@ -572,14 +573,10 @@ async function createAttachment({
       sha256: saved.sha256,
       demo: true,
     };
-    await firestoreManager.createDocument(
-      "ChatAttachments",
-      attachment.id,
-      "/",
-      attachment,
-    );
-    const { id, kind, name, size, url, sha256 } = attachment;
-    return { id, kind, name, mimeType, size, url, sha256 };
+    await saveAttachment(chatId, attachment);
+    const { id, kind, name, size, url, sha256, durationMs } = attachment;
+    return { id, kind, name, mimeType, size, url, sha256,
+      ...(durationMs ? { durationMs } : {}) };
   }
   if (senderId !== account.phoneNumber)
     throw new Error("Demo attachment sender must own its API credential.");
@@ -603,16 +600,24 @@ async function createAttachment({
     `${messageType} attachment upload`,
   );
   const attachment = payload.attachment;
-  await verifyDownload(attachment.url, buffer, `${messageType} attachment`);
-  await firestoreManager.updateDocument("ChatAttachments", attachment.id, "/", {
-    ...attachment,
+  // MP4 normalization changes container bytes without re-encoding the media.
+  // Images and non-MP4 videos must remain byte-identical.
+  const downloaded = await verifyDownload(attachment.url,
+    uploadMimeType === "video/mp4" ? null : buffer,
+    `${messageType} attachment`);
+  const downloadedHash = crypto.createHash("sha256").update(downloaded).digest("hex");
+  if (attachment.sha256 && downloadedHash !== attachment.sha256) {
+    throw new Error(`${messageType} attachment checksum does not match server metadata.`);
+  }
+  await updateAttachment(chatId, attachment.id, {
     status: "attached",
     messageId,
     attachedTime: sentTime,
     demo: true,
   });
-  const { id, kind, name, mimeType, size, url, sha256 } = attachment;
-  return { id, kind, name, mimeType, size, url, sha256 };
+  const { id, kind, name, mimeType, size, url, sha256, durationMs } = attachment;
+  return { id, kind, name, mimeType, size, url, sha256,
+    ...(durationMs ? { durationMs } : {}) };
 }
 async function createMessage({
   chatId,
@@ -725,6 +730,19 @@ async function createDemoChat({ messageCount, assets }) {
     if (message.callId) callMessages.push(message);
   }
   const writeResult = await upsertShardedEntries("Chats", chatId, messages);
+  const expectedAttachmentIds = Object.values(messages)
+    .map((message) => message.attachment && message.attachment.id)
+    .filter(Boolean);
+  const storedAttachments = await readShardedMap(
+    "ChatAttachments", chatId, "attachments");
+  for (const attachmentId of expectedAttachmentIds) {
+    const stored = storedAttachments && storedAttachments[attachmentId];
+    if (!stored || stored.chatId !== chatId || stored.status !== "attached") {
+      throw new Error(
+        `Attachment ${attachmentId} was not stored in the chat-scoped attachment batches.`,
+      );
+    }
+  }
   const createdChatIds = new Set(
     Object.values(messages).map((message) => message.chatId),
   );

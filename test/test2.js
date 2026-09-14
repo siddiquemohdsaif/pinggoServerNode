@@ -4,7 +4,7 @@ require("dotenv").config();
 
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { deleteFile } = require("../utils/fileStorage");
-const { deleteShardCollections } = require("../models/ShardedDocumentStore");
+const { deleteShardCollections, readShardedMap } = require("../models/ShardedDocumentStore");
 
 const firestoreManager = FirestoreManager.getInstance();
 const DEMO_GENERATOR = "test/test1.js";
@@ -114,26 +114,36 @@ async function findAllDemoChatIds(demoPhoneNumbers) {
 }
 
 async function deleteMatchingAttachments(chatIds, demoPhoneNumbers) {
-  const attachmentIds = await firestoreManager.readCollectionDocumentIds(
-    "ChatAttachments",
-    "/",
-  );
   let deletedCount = 0;
 
-  for (const attachmentId of attachmentIds) {
-    const attachment = await readDocumentOrNull("ChatAttachments", attachmentId);
-    if (!attachment) continue;
-
-    const belongsToCleanup =
-      chatIds.has(attachment.chatId) ||
-      demoPhoneNumbers.includes(String(attachment.uploaderId || ""));
-    if (!belongsToCleanup) continue;
-
-    if (attachment.fullPath) {
-      await deleteFile(attachment.fullPath);
+  // Current schema: one root per chat with attachment-id fields in MessageBatches.
+  for (const chatId of chatIds) {
+    const collection = String(chatId).startsWith("grp_")
+      ? "GroupAttachments" : "ChatAttachments";
+    const attachments = await readShardedMap(collection, chatId, "attachments");
+    for (const attachment of Object.values(attachments || {})) {
+      if (attachment && attachment.fullPath) await deleteFile(attachment.fullPath);
+      deletedCount += 1;
     }
-    await firestoreManager.deleteDocument("ChatAttachments", attachmentId, "/");
-    deletedCount += 1;
+    await deleteShardCollections(collection, chatId);
+    await deleteDocumentIfPresent(collection, chatId);
+  }
+
+  // Previous flat schema: retain cleanup support until all environments migrate.
+  for (const collection of ["ChatAttachments", "GroupAttachments"]) {
+    const attachmentIds = await firestoreManager.readCollectionDocumentIds(collection, "/");
+    for (const attachmentId of attachmentIds) {
+      const attachment = await readDocumentOrNull(collection, attachmentId);
+      if (!attachment || !attachment.chatId) continue;
+
+      const belongsToCleanup = chatIds.has(attachment.chatId)
+        || demoPhoneNumbers.includes(String(attachment.uploaderId || ""));
+      if (!belongsToCleanup) continue;
+
+      if (attachment.fullPath) await deleteFile(attachment.fullPath);
+      await firestoreManager.deleteDocument(collection, attachmentId, "/");
+      deletedCount += 1;
+    }
   }
 
   return deletedCount;
