@@ -3,6 +3,11 @@ const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs").promises;
+const nodeFs = require("fs");
+const os = require("os");
+const { pipeline } = require("stream/promises");
+const { performance } = require("perf_hooks");
+const metrics = require("../services/performanceMetrics");
 const AES = require("../utils/AES_256");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const groupService = require("../services/groupService");
@@ -13,7 +18,7 @@ const { deleteFile, maxFileSizeMb, resolveUploadPath, saveFile, uploadDir } = re
 const router = express.Router();
 const firestoreManager = FirestoreManager.getInstance();
 const upload = multer({
-  storage: multer.memoryStorage(),
+  dest: os.tmpdir(),
   limits: { fileSize: maxFileSizeMb * 1024 * 1024 },
 });
 const KINDS = new Set(["image", "video", "audio", "file"]);
@@ -30,6 +35,40 @@ const chunkUpload = multer({
   // truncated. Allow one byte here; the route below still enforces the exact
   // expected chunk length and therefore never accepts a chunk over 3 MB.
   limits: { fileSize: CHUNK_SIZE + 1 },
+});
+
+const activeUploads = new Map();
+let globalActiveUploads = 0;
+router.use((req, res, next) => {
+  if (req.method !== "POST") return next();
+  const userId = normalizeId(AES.getAuthUid(req));
+  const perUser = activeUploads.get(userId) || 0;
+  const globalLimit = Math.max(1, Number(process.env.MAX_CONCURRENT_UPLOADS) || 8);
+  const userLimit = Math.max(1, Number(process.env.MAX_CONCURRENT_UPLOADS_PER_USER) || 2);
+  if (globalActiveUploads >= globalLimit || perUser >= userLimit) {
+    return res.status(429).json({ success: false,
+      message: "Upload concurrency limit reached. Retry shortly." });
+  }
+  globalActiveUploads += 1;
+  activeUploads.set(userId, perUser + 1);
+  const started = performance.now();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    globalActiveUploads = Math.max(0, globalActiveUploads - 1);
+    const remaining = (activeUploads.get(userId) || 1) - 1;
+    if (remaining > 0) activeUploads.set(userId, remaining);
+    else activeUploads.delete(userId);
+    const bytes = req.file && req.file.size || Number(req.body && req.body.totalSize) || 0;
+    metrics.increment("attachments.requests");
+    metrics.increment("attachments.bytes", bytes);
+    metrics.observe("attachment", performance.now() - started,
+      { method: req.method, status: res.statusCode, bytes });
+  };
+  res.once("finish", release);
+  res.once("close", release);
+  next();
 });
 
 router.post("/init", async (req, res, next) => {
@@ -140,14 +179,19 @@ router.post("/:uploadId/complete", async (req, res, next) => {
     finalPath = resolveUploadPath(relativePath);
     if (!finalPath) return res.status(400).json({ success: false, message: "Invalid attachment path." });
     await fs.mkdir(path.dirname(finalPath), { recursive: true });
-    await fs.writeFile(finalPath, Buffer.alloc(0));
     let assembledSize = 0;
-    for (let index = 0; index < manifest.totalChunks; index += 1) {
-      const chunk = await fs.readFile(path.join(getChunkSessionDir(manifest.uploadId), `${index}.part`));
-      assembledSize += chunk.length;
-      if (assembledSize > MAX_FILE_BYTES) throw statusError(413, `File is larger than ${maxFileSizeMb} MB.`);
-      await fs.appendFile(finalPath, chunk);
+    async function* chunks() {
+      for (let index = 0; index < manifest.totalChunks; index += 1) {
+        const chunkPath = path.join(getChunkSessionDir(manifest.uploadId), `${index}.part`);
+        const stat = await fs.stat(chunkPath);
+        assembledSize += stat.size;
+        if (assembledSize > MAX_FILE_BYTES) {
+          throw statusError(413, `File is larger than ${maxFileSizeMb} MB.`);
+        }
+        yield* nodeFs.createReadStream(chunkPath);
+      }
     }
+    await pipeline(chunks(), nodeFs.createWriteStream(finalPath, { flags: "wx" }));
     if (assembledSize !== manifest.totalSize) throw statusError(400, "Assembled file size does not match upload session.");
     const inspected = await inspectFile(finalPath);
     const fileHash = inspected.hash;
@@ -229,13 +273,14 @@ router.post("/", upload.single("file"), async (req, res, next) => {
     if (kind === "audio" && !req.file.mimetype.startsWith("audio/")) {
       return res.status(400).json({ success: false, message: "Selected file is not audio." });
     }
-    if (!matchesDeclaredContent(req.file.buffer, kind, req.file.mimetype)) {
+    const stagedInspection = await inspectFile(req.file.path);
+    if (!matchesDeclaredContent(stagedInspection.header, kind, req.file.mimetype)) {
       return res.status(400).json({ success: false, message: "Attachment content does not match its declared type." });
     }
 
     const attachmentId = crypto.randomUUID();
     savedFile = await saveFile({
-      buffer: req.file.buffer,
+      sourcePath: req.file.path,
       requestedPath: `${chatId.startsWith("grp_") ? "group_attachments" : "chat_attachments"}/${sanitize(chatId)}/${attachmentId}-${sanitize(req.file.originalname)}`,
       originalName: req.file.originalname,
       mimeType: req.file.mimetype,
@@ -265,6 +310,8 @@ router.post("/", upload.single("file"), async (req, res, next) => {
   } catch (error) {
     if (savedFile) await deleteFile(savedFile.fullPath).catch(() => null);
     return next(error);
+  } finally {
+    if (req.file && req.file.path) await fs.unlink(req.file.path).catch(() => null);
   }
 });
 

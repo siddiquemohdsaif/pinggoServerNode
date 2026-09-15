@@ -33,10 +33,28 @@ const { maxFileSizeMb, uploadDir } = require("./utils/fileStorage");
 const { isDeviceRevoked } = require("./models/DeviceStore");
 const { isAccountDeleted, isCurrentPrimaryCredential } =
   require("./services/accountDeletionService");
+const metrics = require("./services/performanceMetrics");
+const { getOnlineUserCount, getOnlineDeviceCount } = require("./realtime/connectionManager");
+const retryQueue = require("./services/retryQueue");
+const { closeRedis } = require("./services/redisClient");
+const { sendOfflineMessageNotification } = require("./realtime/fcmService");
 
 // app.use(express.json());
-app.use(express.json({ limit: `${Math.ceil(maxFileSizeMb * 1.5)}mb` }));
+app.use(metrics.httpMiddleware);
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
 app.use("/files", express.static(uploadDir));
+
+app.get("/internal/metrics", (req, res) => {
+  const expected = process.env.METRICS_TOKEN;
+  if (!expected && process.env.PRODUCTION_TYPE === "release") {
+    return res.status(503).json({ success: false, message: "Metrics token is not configured." });
+  }
+  if (expected && req.get("authorization") !== `Bearer ${expected}`) {
+    return res.status(401).json({ success: false, message: "Metrics authorization failed." });
+  }
+  return res.json(metrics.snapshot({ onlineUsers: getOnlineUserCount(),
+    onlineDevices: getOnlineDeviceCount() }));
+});
 
 // Use routes without authorization
 app.use("/healthCheck", healthCheck);
@@ -94,6 +112,8 @@ app.use((error, _req, res, _next) => {
 });
 
 const server = http.createServer(app);
+retryQueue.register("offline-message-notification", sendOfflineMessageNotification);
+retryQueue.start();
 const signalingWebSocketServer = createWebSocketServer();
 const mediaWebSocketServer = createMediaWebSocketServer();
 
@@ -128,3 +148,13 @@ server.listen(port, () => {
   console.log(`Server is running on port ${port}`);
   console.log(`Uploads are stored in ${uploadDir}`);
 });
+
+async function shutdown() {
+  retryQueue.stop();
+  server.close(async () => {
+    await closeRedis();
+    process.exit(0);
+  });
+}
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);

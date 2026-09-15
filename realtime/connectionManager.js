@@ -1,4 +1,5 @@
 const { randomUUID } = require("crypto");
+const metrics = require("../services/performanceMetrics");
 
 // accountId -> (deviceId -> WebSocket). Older clients receive a temporary
 // connection id, so a second installation no longer evicts the first one.
@@ -21,6 +22,7 @@ function addUser(userId, deviceId, ws) {
   ws.isAuthenticated = true;
   ws.activeChatId = "";
   devices.set(deviceId, ws);
+  metrics.increment("websocket.connections.opened");
   return deviceId;
 }
 
@@ -43,6 +45,7 @@ function removeUser(userId, ws) {
   const devices = onlineUsers.get(userId);
   if (!devices) return;
   if (devices.get(ws.deviceId) === ws) devices.delete(ws.deviceId);
+  metrics.increment("websocket.connections.closed");
   if (devices.size === 0) onlineUsers.delete(userId);
 }
 

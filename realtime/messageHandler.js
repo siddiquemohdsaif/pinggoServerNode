@@ -8,6 +8,8 @@ const { ensureShardedContainer, readShardedMap, upsertShardedEntries } = require
 const { ensureAccountCollections } = require("../models/AccountStore");
 const { isAccountDeleted } = require("../services/accountDeletionService");
 const { readAttachment, updateAttachment } = require("../models/ChatAttachmentStore");
+const { getJson, setJson } = require("../services/redisStore");
+const { enqueue } = require("../services/retryQueue");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -79,6 +81,14 @@ async function handleSendMessage(ws, payload, sendJson) {
   // existing record instead of creating a duplicate or rejecting its now-used
   // attachment.
   if (clientMessageId) {
+    const idempotencyKey = `pinggo:idempotency:message:${senderId}:${clientMessageId}`;
+    const cachedMessage = await getJson(idempotencyKey);
+    if (cachedMessage && cachedMessage.chatId === chatId) {
+      sendJson(ws, { type: "message_ack", clientMessageId,
+        messageId: cachedMessage.id, chatId, status: "sent",
+        sentTime: cachedMessage.sentTime, message: cachedMessage });
+      return;
+    }
     const existingChat = await getChat(chatId);
     const existingMessage = existingChat && Object.values(existingChat).find((item) =>
       item && item.clientMessageId === clientMessageId
@@ -155,6 +165,9 @@ async function handleSendMessage(ws, payload, sendJson) {
     const suppressedForReceiver = await isBlockedBy(receiverId, senderId);
     await ensureChatReadyForMessage(chatId, senderId, receiverId);
     await saveMessage(chatId, message);
+    if (clientMessageId) await setJson(
+      `pinggo:idempotency:message:${senderId}:${clientMessageId}`,
+      forStorage(message), 24 * 60 * 60);
     if (suppressedForReceiver) {
       message.invisible = [receiverId];
       await saveMessage(chatId, message);
@@ -216,6 +229,8 @@ async function sendFcmWithoutFailingMessage({ receiverId, message }) {
   try {
     return await sendOfflineMessageNotification({ receiverId, message });
   } catch (error) {
+    await enqueue("offline-message-notification", {
+      receiverId, message: forStorage(message) });
     return {
       success: false,
       skipped: false,

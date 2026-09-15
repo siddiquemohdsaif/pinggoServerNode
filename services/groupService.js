@@ -7,6 +7,8 @@ const { sendOfflineMessageNotification } = require("../realtime/fcmService");
 const { ensureShardedContainer, readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { ensureAccountCollections } = require("../models/AccountStore");
 const { readAttachment, updateAttachment } = require("../models/ChatAttachmentStore");
+const { getJson, setJson, remove } = require("./redisStore");
+const { enqueue } = require("./retryQueue");
 
 const firestore = FirestoreManager.getInstance();
 const MAX_MEMBERS = 1024;
@@ -67,13 +69,24 @@ function publicGroup(group) {
     members: Object.values(group.members || {}) };
 }
 async function readGroup(groupId) {
-  try { return await firestore.readDocument("GroupsList", text(groupId), "/"); }
+  const id = text(groupId);
+  const key = `pinggo:cache:group:${id}`;
+  try {
+    const cached = await getJson(key);
+    if (cached) return cached;
+    const group = await firestore.readDocument("GroupsList", id, "/");
+    if (group) await setJson(key, group, 30);
+    return group;
+  }
   catch (_error) { return null; }
 }
 async function writeGroup(group) {
   const stored = withoutId(group);
-  try { return await firestore.updateDocument("GroupsList", group.groupId, "/", stored); }
-  catch (_error) { return firestore.createDocument("GroupsList", group.groupId, "/", stored); }
+  let result;
+  try { result = await firestore.updateDocument("GroupsList", group.groupId, "/", stored); }
+  catch (_error) { result = await firestore.createDocument("GroupsList", group.groupId, "/", stored); }
+  await remove(`pinggo:cache:group:${group.groupId}`);
+  return result;
 }
 async function readChat(groupId) {
   try { return await readShardedMap("GroupsChat", groupId); }
@@ -151,7 +164,11 @@ async function fanOutMessage(group, message, senderId) {
       groupIcon: group.icon || null });
     if (m.userId !== accountId(senderId) && !isUserOnline(accountId(m.userId))) {
       sendOfflineMessageNotification({ receiverId: m.userId, message, group })
-        .catch((error) => console.error("Could not send group notification:", error.message));
+        .catch(async (error) => {
+          console.error("Could not send group notification:", error.message);
+          await enqueue("offline-message-notification", {
+            receiverId: m.userId, message: forStorage(message), group: publicGroup(group) });
+        });
     }
   });
 }
@@ -356,8 +373,16 @@ async function sendGroupMessage(ws, payload, sendJson) {
     if (group.permissions?.sendMessages === "admins" && !isAdmin(group, senderId)) throw Object.assign(new Error("Only administrators can send messages."), { statusCode: 403 });
     const messageText = text(payload.text); const messageType = text(payload.messageType || "text").toLowerCase();
     if (!messageText && messageType === "text") throw new Error("text is required.");
-    const chat = await readChat(groupId);
     const clientMessageId = text(payload.clientMessageId || payload.localMessageId);
+    const idempotencyKey = `pinggo:idempotency:group-message:${senderId}:${clientMessageId}`;
+    const cachedMessage = clientMessageId ? await getJson(idempotencyKey) : null;
+    if (cachedMessage && cachedMessage.groupId === groupId) {
+      sendJson(ws, { type: "group_message_ack", clientMessageId,
+        messageId: cachedMessage.id, chatId: groupId, status: "sent",
+        sentTime: cachedMessage.sentTime, message: cachedMessage });
+      return;
+    }
+    const chat = await readChat(groupId);
     const duplicate = clientMessageId && chat && Object.values(chat).find((m) => m && m.clientMessageId === clientMessageId && accountId(m.senderId) === senderId);
     if (duplicate) { sendJson(ws, { type: "group_message_ack", clientMessageId, message: forStorage(duplicate) }); return; }
     let attachment = payload.attachment || null;
@@ -383,6 +408,7 @@ async function sendGroupMessage(ws, payload, sendJson) {
     await ensureChat(groupId); await upsertShardedEntries("GroupsChat", groupId, {
       [message.id]: forStorage(message),
     });
+    if (clientMessageId) await setJson(idempotencyKey, forStorage(message), 24 * 60 * 60);
     if (attachmentId) await updateAttachment(groupId, attachmentId, {
       status: "used", messageId: message.id, usedAt: sentTime,
     });

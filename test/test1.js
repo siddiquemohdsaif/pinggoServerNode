@@ -8,10 +8,9 @@ const FirestoreManager = require("../Firestore/FirestoreManager");
 const UserModel = require("../models/UserModel");
 const { readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { MESSAGE_TYPE_CODES, forStorage } = require("../utils/messageTypes");
-const { saveFile } = require("../utils/fileStorage");
 const { ensureAccountCollections } = require("../models/AccountStore");
 const { saveCallLog } = require("../models/CallLogStore");
-const { saveAttachment, updateAttachment } = require("../models/ChatAttachmentStore");
+const { updateAttachment } = require("../models/ChatAttachmentStore");
 const AES = require("../utils/AES_256");
 
 const firestoreManager = FirestoreManager.getInstance();
@@ -22,8 +21,8 @@ const MAXIMUM_CHAT_COUNT = 100;
 const DEFAULT_CHAT_COUNT = 1;
 const MINIMUM_MESSAGE_COUNT = 1;
 const MAXIMUM_MESSAGE_COUNT = 10_000;
-const DEFAULT_MIN_MESSAGE_COUNT = 1;
-const DEFAULT_MAX_MESSAGE_COUNT = 100;
+const DEFAULT_MIN_MESSAGE_COUNT = 4000;
+const DEFAULT_MAX_MESSAGE_COUNT = 4000;
 const DEMO_GENERATOR = "test/test1.js";
 const MESSAGE_TYPES = Object.freeze(Object.keys(MESSAGE_TYPE_CODES));
 const FIRST_NAMES = [
@@ -300,10 +299,6 @@ function readMessageRange(args = process.argv.slice(2)) {
 function randomMessageCount({ minimum, maximum }) {
   return minimum === maximum ? minimum : crypto.randomInt(minimum, maximum + 1);
 }
-function publicUrl(publicPath) {
-  const base = String(process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-  return base ? `${base}${publicPath}` : publicPath;
-}
 function apiBaseUrl() {
   const configured =
     process.env.TEST_API_BASE_URL || process.env.PUBLIC_BASE_URL;
@@ -357,8 +352,17 @@ function assetMimeType(asset, kind) {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
     ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
   };
-  return types[extension] || (kind === "image" ? "image/jpeg" : "video/mp4");
+  if (types[extension]) return types[extension];
+  if (kind === "image") return "image/jpeg";
+  if (kind === "audio") return "audio/mp4";
+  return "video/mp4";
 }
 async function listFiles(directory) {
   const entries = await fs.readdir(directory, { withFileTypes: true });
@@ -366,33 +370,20 @@ async function listFiles(directory) {
     .filter((entry) => entry.isFile())
     .map((entry) => path.join(directory, entry.name));
 }
-async function copyAsset(sourcePath, requestedPath, mimeType) {
-  const buffer = await fs.readFile(sourcePath);
-  const saved = await saveFile({
-    buffer,
-    requestedPath,
-    originalName: path.basename(sourcePath),
-    mimeType,
-  });
-  return {
-    ...saved,
-    url: publicUrl(saved.publicPath),
-    sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
-  };
-}
 async function prepareDemoAssets() {
-  const [profiles, images, videos] = await Promise.all([
+  const [profiles, images, videos, audio] = await Promise.all([
     listFiles(path.join(DEMO_ASSET_DIRECTORY, "profile")),
     listFiles(path.join(DEMO_ASSET_DIRECTORY, "image")),
     listFiles(path.join(DEMO_ASSET_DIRECTORY, "video")),
+    listFiles(path.join(DEMO_ASSET_DIRECTORY, "audio")),
   ]);
-  if (!profiles.length || !images.length || !videos.length)
+  if (!profiles.length || !images.length || !videos.length || !audio.length)
     throw new Error(
-      `${DEMO_ASSET_DIRECTORY} must contain profile, image, and video files.`,
+      `${DEMO_ASSET_DIRECTORY} must contain profile, image, video, and audio files.`,
     );
   // Message attachments are uploaded later, after the one chat id is known, so
   // their paths match the production chat-attachment layout.
-  return { profiles, images, videos };
+  return { profiles, images, videos, audio };
 }
 function randomUppercase(length) {
   const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -546,42 +537,12 @@ async function createAttachment({
   sentTime,
   account,
 }) {
-  if (!["image", "video"].includes(messageType)) {
-    const mimeType =
-      messageType === "audio" ? "audio/mp4" : "application/octet-stream";
-    const attachmentId = crypto.randomUUID();
-    const saved = await copyAsset(
-      asset,
-      `chat_attachments/${chatId}/${attachmentId}-${path.basename(asset)}`,
-      mimeType,
-    );
-    const attachment = {
-      id: attachmentId,
-      chatId,
-      uploaderId: senderId,
-      kind: messageType,
-      name: path.basename(asset),
-      mimeType,
-      size: saved.size,
-      fullPath: saved.fullPath,
-      url: saved.url,
-      status: "attached",
-      createdTime: sentTime,
-      completedTime: sentTime,
-      messageId,
-      attachedTime: sentTime,
-      sha256: saved.sha256,
-      demo: true,
-    };
-    await saveAttachment(chatId, attachment);
-    const { id, kind, name, size, url, sha256, durationMs } = attachment;
-    return { id, kind, name, mimeType, size, url, sha256,
-      ...(durationMs ? { durationMs } : {}) };
-  }
   if (senderId !== account.phoneNumber)
     throw new Error("Demo attachment sender must own its API credential.");
   const buffer = await fs.readFile(asset);
-  const uploadMimeType = assetMimeType(asset, messageType);
+  const uploadMimeType = messageType === "file"
+    ? "application/octet-stream"
+    : assetMimeType(asset, messageType);
   const form = new FormData();
   form.append("chatId", chatId);
   form.append("kind", messageType);
@@ -600,10 +561,10 @@ async function createAttachment({
     `${messageType} attachment upload`,
   );
   const attachment = payload.attachment;
-  // MP4 normalization changes container bytes without re-encoding the media.
-  // Images and non-MP4 videos must remain byte-identical.
+  // MP4 video normalization changes container bytes without re-encoding media.
+  // Every other attachment type must remain byte-identical.
   const downloaded = await verifyDownload(attachment.url,
-    uploadMimeType === "video/mp4" ? null : buffer,
+    messageType === "video" && uploadMimeType === "video/mp4" ? null : buffer,
     `${messageType} attachment`);
   const downloadedHash = crypto.createHash("sha256").update(downloaded).digest("hex");
   if (attachment.sha256 && downloadedHash !== attachment.sha256) {
@@ -640,7 +601,11 @@ async function createMessage({
   if (messageType === "text")
     message.text = `Demo text message ${sequence + 1}`;
   if (["image", "video", "audio", "file"].includes(messageType)) {
-    const asset = messageType === "image" ? assets.image : assets.video;
+    const asset = messageType === "image"
+      ? assets.image
+      : messageType === "audio"
+        ? assets.audio
+        : assets.video;
     message.text = `Demo ${messageType} attachment`;
     message.attachment = await createAttachment({
       chatId,
@@ -711,8 +676,9 @@ async function createDemoChat({ messageCount, assets }) {
   const messages = {};
   const callMessages = [];
   for (let index = 0; index < messageCount; index += 1) {
-    const mediaMessage = ["image", "video"].includes(messageTypes[index]);
-    const outgoing = mediaMessage || index % 2 === 0;
+    const attachmentMessage = ["image", "video", "audio", "file"]
+      .includes(messageTypes[index]);
+    const outgoing = attachmentMessage || index % 2 === 0;
     const message = await createMessage({
       chatId,
       senderId: outgoing ? account.phoneNumber : TARGET_PHONE_NUMBER,
@@ -723,6 +689,7 @@ async function createDemoChat({ messageCount, assets }) {
       assets: {
         image: randomItem(assets.images),
         video: randomItem(assets.videos),
+        audio: randomItem(assets.audio),
       },
       account,
     });

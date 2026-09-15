@@ -1,6 +1,8 @@
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs").promises;
+const nodeFs = require("fs");
+const { pipeline } = require("stream/promises");
 
 const defaultUploadDir = process.platform === "win32"
   ? path.join(__dirname, "..", "public")
@@ -52,11 +54,12 @@ function resolveUploadPath(relativePath) {
   return targetPath.startsWith(`${uploadDir}${path.sep}`) ? targetPath : null;
 }
 
-async function saveFile({ buffer, requestedPath, originalName = "file", mimeType }) {
-  if (!Buffer.isBuffer(buffer)) {
-    throw new TypeError("File data must be a Buffer.");
+async function saveFile({ buffer, sourcePath, requestedPath, originalName = "file", mimeType }) {
+  if (!Buffer.isBuffer(buffer) && !sourcePath) {
+    throw new TypeError("File data must be a Buffer or source path.");
   }
-  if (buffer.length > maxFileSizeMb * 1024 * 1024) {
+  const sourceSize = sourcePath ? (await fs.stat(sourcePath)).size : buffer.length;
+  if (sourceSize > maxFileSizeMb * 1024 * 1024) {
     const error = new Error(`File is larger than ${maxFileSizeMb} MB.`);
     error.statusCode = 413;
     throw error;
@@ -71,13 +74,18 @@ async function saveFile({ buffer, requestedPath, originalName = "file", mimeType
   }
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  await fs.writeFile(targetPath, buffer);
+  if (sourcePath) {
+    await pipeline(nodeFs.createReadStream(sourcePath), nodeFs.createWriteStream(targetPath,
+      { flags: "wx" }));
+  } else {
+    await fs.writeFile(targetPath, buffer, { flag: "wx" });
+  }
   return {
     originalName,
     fileName: path.basename(relativePath),
     fullPath: relativePath.replace(/\\/g, "/"),
     mimeType: mimeType || "application/octet-stream",
-    size: buffer.length,
+    size: sourceSize,
     publicPath: `/files/${relativePath.replace(/\\/g, "/")}`,
   };
 }

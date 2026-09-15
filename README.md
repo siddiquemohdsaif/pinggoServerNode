@@ -196,6 +196,52 @@ npm test
 
 Tests cover multi-device connections, device credentials and pairing, attachment storage, LiveKit token grants, and video normalization.
 
+Run the syntax checks and complete test gate with:
+
+```sh
+npm run check
+```
+
+## Performance and observability
+
+`GET /internal/metrics` reports bounded-window p50/p95/p99 HTTP, datastore,
+attachment and WebSocket acknowledgement latency together with event-loop delay,
+process memory/CPU, error counters, connection counts and transferred bytes. Set
+`METRICS_TOKEN` in production and send it as a Bearer token.
+
+Useful production limits are configurable without code changes:
+
+```env
+METRICS_TOKEN=replace-me
+JSON_BODY_LIMIT=1mb
+DATASTORE_TIMEOUT_MS=10000
+DATASTORE_MAX_SOCKETS=32
+SLOW_DATASTORE_QUERY_MS=750
+WS_MAX_PAYLOAD_BYTES=262144
+WS_MAX_PENDING_EVENTS=128
+WS_MAX_BUFFERED_BYTES=1048576
+WS_HEARTBEAT_MS=30000
+MAX_CONCURRENT_UPLOADS=8
+MAX_CONCURRENT_UPLOADS_PER_USER=2
+REDIS_URL=redis://127.0.0.1:6379
+```
+
+Redis is optional for local development. When configured, it supplies durable
+notification retries, restart-safe direct/group message idempotency, shared OTP
+and authentication rate limits, and short-lived user/group caches. Active
+WebSocket objects remain in the Node process because they cannot be serialized.
+
+After starting a test instance, run the repeatable HTTP latency gate:
+
+```sh
+npm run load:test
+```
+
+Configure it with `LOAD_TEST_URL`, `LOAD_TEST_REQUESTS`,
+`LOAD_TEST_CONCURRENCY`, and `LOAD_TEST_MAX_P95_MS`. Point it at authorized
+chat, group, call, or upload test endpoints in an isolated environment; never
+load-test production user data.
+
 ## Migrations
 
 Always preview first:

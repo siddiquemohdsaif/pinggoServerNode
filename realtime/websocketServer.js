@@ -34,13 +34,25 @@ const {
 } = require("./callHandler");
 const { sendGroupMessage, markGroupMessages } = require("../services/groupService");
 const { isDeviceRevoked, touchDevice } = require("../models/DeviceStore");
+const metrics = require("../services/performanceMetrics");
+const { performance } = require("perf_hooks");
+
+const MAX_SOCKET_PAYLOAD = Math.max(1024, Number(process.env.WS_MAX_PAYLOAD_BYTES) || 256 * 1024);
+const MAX_PENDING_EVENTS = Math.max(8, Number(process.env.WS_MAX_PENDING_EVENTS) || 128);
+const MAX_BUFFERED_BYTES = Math.max(64 * 1024,
+  Number(process.env.WS_MAX_BUFFERED_BYTES) || 1024 * 1024);
 
 function createWebSocketServer() {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_SOCKET_PAYLOAD,
+    perMessageDeflate: { threshold: 1024 } });
 
   wss.on("connection", (ws, req) => {
     console.log(`[signal-socket] connected remote=${req.socket.remoteAddress || "unknown"} time=${Date.now()}`);
     ws.authorization = req.headers.authorization || "";
+    ws.isAlive = true;
+    ws.pendingEvents = 0;
+    ws.eventChain = Promise.resolve();
+    ws.on("pong", () => { ws.isAlive = true; });
 
     ws.send(
       JSON.stringify({
@@ -50,12 +62,38 @@ function createWebSocketServer() {
     );
 
     ws.on("message", (rawMessage) => {
-      handleMessage(ws, rawMessage).catch((error) => {
+      let message;
+      try {
+        message = JSON.parse(rawMessage.toString());
+      } catch (_error) {
+        metrics.increment("websocket.events.invalid_json");
+        sendJson(ws, { type: "error", message: "Invalid JSON message." });
+        return;
+      }
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        sendJson(ws, { type: "error", message: "WebSocket event must be an object." });
+        return;
+      }
+      if (ws.pendingEvents >= MAX_PENDING_EVENTS) {
+        metrics.increment("websocket.events.rejected_backpressure");
+        sendJson(ws, { type: "error", message: "Too many pending events." });
+        return;
+      }
+      ws.pendingEvents += 1;
+      metrics.increment("websocket.events.received");
+      const queuedAt = performance.now();
+      ws.eventChain = ws.eventChain.then(() => handleMessage(ws, message)).then(() => {
+        if (message.type === "send_message" || message.type === "send_group_message") {
+          metrics.observe("websocketAck", performance.now() - queuedAt,
+            { type: message.type });
+        }
+      }).catch((error) => {
+        metrics.increment("errors.websocket");
         sendJson(ws, {
           type: "error",
           message: "Unable to process WebSocket message.",
         });
-      });
+      }).finally(() => { ws.pendingEvents -= 1; });
     });
 
     ws.on("close", () => {
@@ -69,21 +107,20 @@ function createWebSocketServer() {
     ws.on("error", () => {});
   });
 
+  const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (!ws.isAlive) return ws.terminate();
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, Math.max(10000, Number(process.env.WS_HEARTBEAT_MS) || 30000));
+  heartbeat.unref();
+  wss.once("close", () => clearInterval(heartbeat));
+
   return wss;
 }
 
-async function handleMessage(ws, rawMessage) {
-  let message;
-  try {
-    message = JSON.parse(rawMessage.toString());
-  } catch (error) {
-    sendJson(ws, {
-      type: "error",
-      message: "Invalid JSON message.",
-    });
-    return;
-  }
-
+async function handleMessage(ws, message) {
   if (!message.type) {
     sendJson(ws, {
       type: "error",
@@ -359,7 +396,14 @@ function sendJson(ws, payload) {
     return;
   }
 
-  ws.send(JSON.stringify(payload));
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+    metrics.increment("websocket.events.dropped_backpressure");
+    return false;
+  }
+  const encoded = JSON.stringify(payload);
+  ws.send(encoded);
+  metrics.increment("websocket.events.sent");
+  return true;
 }
 
 module.exports = {

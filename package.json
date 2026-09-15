@@ -5,6 +5,8 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "run": "node index.js",
+    "check": "node --check index.js && node --check realtime/websocketServer.js && node --check routes/chatAttachments.js && node --check services/redisClient.js && node --check services/retryQueue.js && node --test test/*.test.js",
+    "load:test": "node scripts/loadTest.js",
     "migrate:sharded:dry-run": "node test/migrateShardedStorage.js",
     "migrate:sharded": "node test/migrateShardedStorage.js --execute",
     "migrate:attachments:dry-run": "node test/migrateShardedAttachments.js",
@@ -24,6 +26,7 @@
     "livekit-server-sdk": "^2.19.0",
     "multer": "^2.2.0",
     "nodemailer": "^9.0.5",
+    "redis": "^5.12.1",
     "sharp": "^0.35.3",
     "ws": "^8.21.3"
   }

@@ -1,10 +1,14 @@
 const express = require("express");
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { rateLimit } = require("../services/rateLimitService");
+const { getJson, setJson } = require("../services/redisStore");
 
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
 
-router.post("/", async (req, res) => {
+router.post("/", rateLimit({ namespace: "login", limit: 20, windowSeconds: 15 * 60,
+  identity: (req) => req.body && (req.body.phoneNumber || req.body.phone_number
+    || req.body.phone) || req.ip }), async (req, res) => {
   try {
     const phoneNumber = normalizePhoneNumber(
       req.body.phoneNumber || req.body.phone_number || req.body.phone,
@@ -49,7 +53,11 @@ function normalizePhoneNumber(value) {
 
 async function getUserByPhoneNumber(phoneNumber) {
   try {
+    const key = `pinggo:cache:user:${phoneNumber}`;
+    const cached = await getJson(key);
+    if (cached) return cached;
     const userDoc = await firestoreManager.readDocument("Users", phoneNumber, "/");
+    if (userDoc) await setJson(key, userDoc, 60);
     return userDoc || false;
   } catch (error) {
     return false;
