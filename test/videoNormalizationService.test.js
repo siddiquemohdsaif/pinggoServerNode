@@ -46,6 +46,15 @@ test("rejects malformed FFprobe output", async () => {
   });
 });
 
+test("video metadata applies display rotation before choosing orientation", async () => {
+  const run = async () => ({ stdout: JSON.stringify({
+    format: { duration: "2" },
+    streams: [{ width: 1920, height: 1080, side_data_list: [{ rotation: -90 }] }],
+  }) });
+  const result = await probeVideo("portrait.mp4", { run });
+  assert.deepEqual(result, { durationSeconds: 2, width: 1080, height: 1920 });
+});
+
 test("normalization maps video and optional audio while dropping data streams", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pinggo-video-"));
   const file = path.join(directory, "fragmented.mp4");

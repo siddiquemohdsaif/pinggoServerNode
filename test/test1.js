@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs").promises;
 const path = require("path");
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { chatEntries } = require("../utils/chatMembership");
 const UserModel = require("../models/UserModel");
 const { readShardedMap, upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { MESSAGE_TYPE_CODES, forStorage } = require("../utils/messageTypes");
@@ -21,8 +22,10 @@ const MAXIMUM_CHAT_COUNT = 100;
 const DEFAULT_CHAT_COUNT = 1;
 const MINIMUM_MESSAGE_COUNT = 1;
 const MAXIMUM_MESSAGE_COUNT = 10_000;
-const DEFAULT_MIN_MESSAGE_COUNT = 4000;
-const DEFAULT_MAX_MESSAGE_COUNT = 4000;
+const DEFAULT_MEDIA_COUNT = 60;
+const DEFAULT_DOCUMENT_COUNT = 40;
+const DEFAULT_MIN_MESSAGE_COUNT = DEFAULT_MEDIA_COUNT + DEFAULT_DOCUMENT_COUNT;
+const DEFAULT_MAX_MESSAGE_COUNT = 100;
 const DEMO_GENERATOR = "test/test1.js";
 const MESSAGE_TYPES = Object.freeze(Object.keys(MESSAGE_TYPE_CODES));
 const FIRST_NAMES = [
@@ -266,6 +269,23 @@ function validateChatCount(value) {
   }
   return count;
 }
+function validateContentCount(value, label) {
+  const count = Number(value);
+  if (!Number.isInteger(count) || count < 0 || count > MAXIMUM_MESSAGE_COUNT)
+    throw new RangeError(`${label} count must be an integer from 0 through ${MAXIMUM_MESSAGE_COUNT}.`);
+  return count;
+}
+function readContentCount(args, names, fallback, label) {
+  const index = args.findIndex((value) => names.includes(value));
+  return validateContentCount(index < 0 ? fallback : args[index + 1], label);
+}
+function readMediaCount(args = process.argv.slice(2)) {
+  return readContentCount(args, ["--media"], DEFAULT_MEDIA_COUNT, "Media");
+}
+function readDocumentCount(args = process.argv.slice(2)) {
+  return readContentCount(args, ["--documents", "--docs"], DEFAULT_DOCUMENT_COUNT,
+    "Document");
+}
 function readChatCount(args = process.argv.slice(2)) {
   const index = args.findIndex(
     (value) => value === "--chats" || value === "-c",
@@ -298,6 +318,15 @@ function readMessageRange(args = process.argv.slice(2)) {
 }
 function randomMessageCount({ minimum, maximum }) {
   return minimum === maximum ? minimum : crypto.randomInt(minimum, maximum + 1);
+}
+function buildMessageTypeSequence(messageCount, mediaCount, documentCount) {
+  if (mediaCount + documentCount > messageCount)
+    throw new RangeError("Media and document counts cannot exceed the message count.");
+  const media = buildRandomizedSequence(["image", "video"], mediaCount);
+  const documents = Array.from({ length: documentCount }, () => "file");
+  const ordinaryTypes = MESSAGE_TYPES.filter(type => !["image", "video", "file"].includes(type));
+  return shuffle([...media, ...documents,
+    ...buildRandomizedSequence(ordinaryTypes, messageCount - mediaCount - documentCount)]);
 }
 function apiBaseUrl() {
   const configured =
@@ -468,21 +497,9 @@ async function addChatToList(phoneNumber, chatId, lastMessage) {
   } catch (_error) {
     /* missing */
   }
-  const stored = current?.list;
-  const list = Array.isArray(stored)
-    ? Object.fromEntries(stored.map((id) => [id, defaultChatSettings()]))
-    : stored && typeof stored === "object"
-      ? stored
-      : {};
+  const list = chatEntries(current);
   const data = {
-    list: {
-      ...list,
-      [chatId]: {
-        ...defaultChatSettings(),
-        ...(list[chatId] || {}),
-        last_message: lastMessage,
-      },
-    },
+    [chatId]: { ...defaultChatSettings(), ...(list[chatId] || {}), last_message: lastMessage },
   };
   if (current)
     await firestoreManager.updateDocument("ChatsList", phoneNumber, "/", data);
@@ -539,17 +556,17 @@ async function createAttachment({
 }) {
   if (senderId !== account.phoneNumber)
     throw new Error("Demo attachment sender must own its API credential.");
-  const buffer = await fs.readFile(asset);
-  const uploadMimeType = messageType === "file"
-    ? "application/octet-stream"
-    : assetMimeType(asset, messageType);
+  const inline = asset && typeof asset === "object" && Buffer.isBuffer(asset.buffer);
+  const buffer = inline ? asset.buffer : await fs.readFile(asset);
+  const fileName = inline ? asset.name : path.basename(asset);
+  const uploadMimeType = inline ? asset.mimeType : assetMimeType(asset, messageType);
   const form = new FormData();
   form.append("chatId", chatId);
   form.append("kind", messageType);
   form.append(
     "file",
     new Blob([buffer], { type: uploadMimeType }),
-    path.basename(asset),
+    fileName,
   );
   const response = await fetch(`${apiBaseUrl()}/chats/attachments`, {
     method: "POST",
@@ -576,9 +593,21 @@ async function createAttachment({
     attachedTime: sentTime,
     demo: true,
   });
-  const { id, kind, name, mimeType, size, url, sha256, durationMs } = attachment;
+  const { id, kind, name, mimeType, size, url, sha256, durationMs,
+    width, height, orientation } = attachment;
   return { id, kind, name, mimeType, size, url, sha256,
-    ...(durationMs ? { durationMs } : {}) };
+    ...(durationMs ? { durationMs } : {}),
+    ...(width && height ? { width, height, orientation } : {}) };
+}
+function demoDocumentAsset(sequence) {
+  return {
+    name: `pinggo-demo-document-${sequence + 1}.txt`,
+    mimeType: "text/plain",
+    buffer: Buffer.from(
+      `Pinggo demo document ${sequence + 1}\nGenerated by ${DEMO_GENERATOR}\n`,
+      "utf8",
+    ),
+  };
 }
 async function createMessage({
   chatId,
@@ -601,7 +630,9 @@ async function createMessage({
   if (messageType === "text")
     message.text = `Demo text message ${sequence + 1}`;
   if (["image", "video", "audio", "file"].includes(messageType)) {
-    const asset = messageType === "image"
+    const asset = messageType === "file"
+      ? demoDocumentAsset(sequence)
+      : messageType === "image"
       ? assets.image
       : messageType === "audio"
         ? assets.audio
@@ -666,12 +697,12 @@ async function createMessage({
     });
   return message;
 }
-async function createDemoChat({ messageCount, assets }) {
+async function createDemoChat({ messageCount, mediaCount, documentCount, assets }) {
   const profileSource = randomItem(assets.profiles);
   const account = await createUniqueAccount(null);
   account.profilePhotoUrl = await uploadProfilePhoto(account, profileSource);
   const chatId = `${account.phoneNumber}_${TARGET_PHONE_NUMBER}`;
-  const messageTypes = buildRandomizedSequence(MESSAGE_TYPES, messageCount);
+  const messageTypes = buildMessageTypeSequence(messageCount, mediaCount, documentCount);
   const now = Date.now();
   const messages = {};
   const callMessages = [];
@@ -771,6 +802,8 @@ async function createDemoChat({ messageCount, assets }) {
     chatId,
     messageCount,
     messageTypes: includedTypes,
+    mediaCount,
+    documentCount,
     callLogCount: callMessages.length,
     writeResult,
   };
@@ -778,6 +811,9 @@ async function createDemoChat({ messageCount, assets }) {
 
 async function startExecution(options = {}) {
   const chatCount = validateChatCount(options.chatCount ?? readChatCount());
+  const mediaCount = validateContentCount(options.mediaCount ?? readMediaCount(), "Media");
+  const documentCount = validateContentCount(
+    options.documentCount ?? readDocumentCount(), "Document");
   const range =
     options.messageCount != null
       ? {
@@ -792,6 +828,11 @@ async function startExecution(options = {}) {
             String(options.maxMessageCount ?? DEFAULT_MAX_MESSAGE_COUNT),
           ])
         : readMessageRange();
+  if (range.minimum < mediaCount + documentCount)
+    throw new RangeError(
+      `Minimum message count must be at least ${mediaCount + documentCount} `
+      + `for ${mediaCount} media and ${documentCount} document messages.`,
+    );
   const assets = await prepareDemoAssets();
   const chats = [];
   for (let index = 0; index < chatCount; index += 1) {
@@ -800,14 +841,16 @@ async function startExecution(options = {}) {
       console.warn(
         `Coverage warning: chat ${index + 1} has ${messageCount} messages and cannot contain all ${MESSAGE_TYPES.length} types.`,
       );
-    chats.push(await createDemoChat({ messageCount, assets }));
+    chats.push(await createDemoChat({ messageCount, mediaCount, documentCount, assets }));
   }
   console.log(
-    `Created ${chats.length} chat(s) with message counts in the requested ${range.minimum}-${range.maximum} range.`,
+    `Created ${chats.length} chat(s) with message counts in the requested ${range.minimum}-${range.maximum} range, ${mediaCount} media, and ${documentCount} documents per chat.`,
   );
   return {
     chatCount: chats.length,
     messageCountRange: range,
+    mediaCount,
+    documentCount,
     chats,
     // Preserve the original result fields for callers that create the default one chat.
     ...(chats.length === 1 ? chats[0] : {}),
@@ -818,13 +861,19 @@ module.exports = {
   COUNTRY_PHONE_FORMATS,
   MESSAGE_TYPES,
   MINIMUM_CHAT_COUNT,
+  DEFAULT_MEDIA_COUNT,
+  DEFAULT_DOCUMENT_COUNT,
   buildRandomizedSequence,
+  buildMessageTypeSequence,
+  demoDocumentAsset,
   createInternationalPhoneNumber,
   createMessage,
   randomMessageCount,
   readChatCount,
   readMessageCount,
   readMessageRange,
+  readMediaCount,
+  readDocumentCount,
   startExecution,
 };
 if (require.main === module)

@@ -6,19 +6,19 @@ const fs = require("fs").promises;
 const DEFAULT_TIMEOUT_MS = 2 * 60 * 1000;
 
 async function normalizeUploadedVideo(filePath, mimeType, options = {}) {
-  if (String(mimeType || "").toLowerCase() !== "video/mp4") return null;
-
   const run = options.run || runProcess;
   const ffprobe = options.ffprobePath || process.env.FFPROBE_PATH || "ffprobe";
   const ffmpeg = options.ffmpegPath || process.env.FFMPEG_PATH || "ffmpeg";
   const timeoutMs = positiveNumber(options.timeoutMs || process.env.VIDEO_NORMALIZE_TIMEOUT_MS)
     || DEFAULT_TIMEOUT_MS;
   const before = await probeVideo(filePath, { run, ffprobe, timeoutMs });
+  if (String(mimeType || "").toLowerCase() !== "video/mp4")
+    return videoMetadata(before, false);
   const fragmented = await hasTopLevelBox(filePath, "moof");
   const needsRemux = fragmented || !positiveNumber(before.durationSeconds);
 
   if (!needsRemux) {
-    return { durationMs: toDurationMs(before.durationSeconds), normalized: false };
+    return videoMetadata(before, false);
   }
 
   const temporaryPath = `${filePath}.normalizing-${crypto.randomUUID()}.mp4`;
@@ -37,7 +37,7 @@ async function normalizeUploadedVideo(filePath, mimeType, options = {}) {
       throw processingError("Normalized video has no valid duration.");
     }
     await replaceFile(filePath, temporaryPath);
-    return { durationMs: toDurationMs(after.durationSeconds), normalized: true };
+    return videoMetadata(after, true);
   } catch (error) {
     await fs.unlink(temporaryPath).catch(() => null);
     if (error.statusCode) throw error;
@@ -50,7 +50,8 @@ async function probeVideo(filePath, { run = runProcess, ffprobe = "ffprobe",
   let result;
   try {
     result = await run(ffprobe, [
-      "-v", "error", "-show_entries", "format=duration",
+      "-v", "error", "-select_streams", "v:0",
+      "-show_entries", "format=duration:stream=width,height:stream_tags=rotate:stream_side_data=rotation",
       "-of", "json", filePath,
     ], timeoutMs);
   } catch (error) {
@@ -58,7 +59,13 @@ async function probeVideo(filePath, { run = runProcess, ffprobe = "ffprobe",
   }
   try {
     const data = JSON.parse(result.stdout || "{}");
-    return { durationSeconds: Number(data.format && data.format.duration) };
+    const stream = Array.isArray(data.streams) ? data.streams[0] || {} : {};
+    const sideData = Array.isArray(stream.side_data_list) ? stream.side_data_list[0] || {} : {};
+    const rotation = Number(sideData.rotation ?? (stream.tags && stream.tags.rotate) ?? 0);
+    let width = positiveNumber(stream.width);
+    let height = positiveNumber(stream.height);
+    if (Math.abs(rotation) % 180 === 90) [width, height] = [height, width];
+    return { durationSeconds: Number(data.format && data.format.duration), width, height };
   } catch (error) {
     throw processingError("FFprobe returned invalid video metadata.", error);
   }
@@ -136,6 +143,16 @@ function positiveNumber(value) {
 
 function toDurationMs(seconds) {
   return Math.max(1, Math.round(Number(seconds) * 1000));
+}
+
+function videoMetadata(probe, normalized) {
+  const result = { durationMs: toDurationMs(probe.durationSeconds), normalized };
+  if (positiveNumber(probe.width) && positiveNumber(probe.height)) {
+    result.width = probe.width;
+    result.height = probe.height;
+    result.orientation = probe.height > probe.width ? "portrait" : "landscape";
+  }
+  return result;
 }
 
 function processingError(message, cause) {

@@ -2,7 +2,7 @@
 
 const express = require("express");
 const AES = require("../utils/AES_256");
-const { registerDevice, listDevices, revokeDevice, getDevice,
+const { registerDevice, listDevices, listOldDevices, revokeDevice, getDevice,
   revokeAllDevices, MAX_DEVICES } = require("../models/DeviceStore");
 const { disconnectDevice, disconnectAccount,
   notifyDeviceUnlinked, resolveUnlinkActorDeviceId } = require("../realtime/connectionManager");
@@ -10,6 +10,27 @@ const { sendSessionLogoutNotification,
   sendDeviceActivityNotification } = require("../realtime/fcmService");
 
 const router = express.Router();
+const UserDeviceInfo = require("../models/UserDeviceInfoStore");
+
+router.get("/history", async (req, res) => {
+  try { return res.json({ success: true, devices: await listOldDevices(AES.getAuthUid(req)) }); }
+  catch (error) { return fail(res, error); }
+});
+router.get("/user-info", async (req, res) => {
+  try { return res.json({ success: true, devices: await UserDeviceInfo.listDevices(AES.getAuthUid(req)) }); }
+  catch (error) { return fail(res, error); }
+});
+router.post("/login", async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (req.auth.deviceId && req.auth.deviceId !== body.deviceId)
+      return res.status(403).json({ success: false, message: "Device credential mismatch." });
+    const device = await registerDevice(AES.getAuthUid(req), {
+      ...body, role: req.auth.deviceId ? "companion" : "primary",
+    }, { login: true });
+    return res.json({ success: true, device });
+  } catch (error) { return fail(res, error); }
+});
 
 router.get("/", async (req, res) => {
   try {

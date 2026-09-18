@@ -1,22 +1,10 @@
-const FirestoreManager = require("../Firestore/FirestoreManager");
 const { callLogForStorage, callLogForClient } = require("../utils/specializedRecords");
 const { deleteShardedEntries, readShardedMap, upsertShardedEntries } = require("./ShardedDocumentStore");
 
-const firestore = FirestoreManager.getInstance();
-const LIST_COLLECTION = "CallsList";
 const LOG_COLLECTION = "CallLogs";
 
 function normalizeId(value) {
   return String(value || "").trim().replace(/^<plus>/, "").replace(/^\+/, "");
-}
-
-async function readDocumentOrNull(collection, documentId) {
-  try { return (await firestore.readDocument(collection, documentId, "/")) || null; }
-  catch (_error) { return null; }
-}
-
-function normalizeList(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
 function buildLog(call) {
@@ -75,29 +63,6 @@ async function readUserTimeline(userId) {
   const merged = new Map(Object.entries(timeline || {})
     .filter(([key, value]) => key !== "_id" && value && typeof value === "object"));
 
-  // CallsList is only a migration index now. Use its chat ids to discover historical logs,
-  // merge them into the per-user timeline, and backfill the new store on first read.
-  const legacyList = await readDocumentOrNull(LIST_COLLECTION, userId);
-  const chatIds = Object.keys(normalizeList(legacyList && legacyList.list));
-  const legacyDocuments = await Promise.all(chatIds.map((chatId) =>
-    readShardedMap(LOG_COLLECTION, chatId, "calls")));
-  const backfill = {};
-  for (const document of legacyDocuments) {
-    for (const [callId, value] of Object.entries(document || {})) {
-      if (callId === "_id" || !value || typeof value !== "object" || merged.has(callId)) continue;
-      const log = callLogForClient(value);
-      const participants = Array.isArray(log.participantIds) && log.participantIds.length
-        ? log.participantIds.map(normalizeId) : [normalizeId(log.callerId), normalizeId(log.receiverId)];
-      if (!participants.includes(userId)) continue;
-      const userLog = { ...log, durationSeconds:
-        log.participantDurationsSeconds?.[userId] ?? log.durationSeconds };
-      merged.set(callId, callLogForStorage(userLog));
-      backfill[callId] = callLogForStorage(userLog);
-    }
-  }
-  if (Object.keys(backfill).length) {
-    await upsertShardedEntries(LOG_COLLECTION, userId, backfill, "calls");
-  }
   return merged;
 }
 

@@ -15,7 +15,8 @@ const RETRY_BASE_DELAY_MS = Math.max(
 // Keep this list synchronized with the collections used by routes/, realtime/, models/, and utils/.
 // Chats/GroupsChat store message batches in nested MessageBatches and metadata documents.
 // CallsList is retained only for legacy-data cleanup; CallLogs stores history by account id.
-// LinkedDevices and DeviceLinkRequests contain account sessions and pending pairing state.
+// LinkedDevices stores active companion links; OldLinkedDevices retains unlink history.
+// UserDeviceInfo tracks login/logout device details; DeviceLinkRequests stores pending pairing state.
 // DeletedAccounts contains deletion/re-registration lifecycle markers and former direct-chat links.
 // ChatAttachments/GroupAttachments use chat-scoped MessageBatches. This script removes
 // their Firestore metadata but does not delete uploaded files from disk/storage.
@@ -30,6 +31,8 @@ const COLLECTIONS_TO_CLEAN = [
   "UserBlocks",
   "DeviceLinkRequests",
   "LinkedDevices",
+  "OldLinkedDevices",
+  "UserDeviceInfo",
   "DeletedAccounts",
   "Chats",
   "GroupsChat",
@@ -195,7 +198,12 @@ const cleanDB = async () => {
   }
 };
 
-cleanDB().catch((error) => {
-  console.error("Database cleanup failed:", error);
-  process.exitCode = 1;
-});
+// Importing this module for tests must never start database deletion.
+if (require.main === module) {
+  cleanDB().catch((error) => {
+    console.error("Database cleanup failed:", error);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { COLLECTIONS_TO_CLEAN, cleanCollection, cleanDB };

@@ -67,7 +67,7 @@ class DevicePairingService {
       if (currentRevokedAt > Number(request.accountSessionRevokedAt || 0)) {
         throw failure(409, "The primary account logged out after this code was approved.");
       }
-      const device = await this.devices.registerDevice(request.accountId, {
+      const device = await (this.devices.linkDevice || this.devices.registerDevice).call(this.devices, request.accountId, {
         deviceId: request.deviceId,
         name: request.deviceName,
         platform: request.platform,

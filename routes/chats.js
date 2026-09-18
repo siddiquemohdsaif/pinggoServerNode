@@ -1,4 +1,5 @@
 const express = require("express");
+const { filterChatListForUser, chatEntries } = require("../utils/chatMembership");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const { getUserSocket } = require("../realtime/connectionManager");
 const { isBlockedBy, setBlocked, listBlocked } = require("../utils/blockUtils");
@@ -31,7 +32,8 @@ router.post("/list", async (req, res) => {
     );
 
     if (userDoc) {
-      const page = paginateChatList(userDoc.list, pageSize, cursor);
+      const visibleList = filterChatListForUser(chatEntries(userDoc), accountId);
+      const page = paginateChatList(visibleList, pageSize, cursor);
       const [userProfiles, messageCache] = await Promise.all([
         getOtherUserProfilesFromChatList(page.chatList, phoneNumber),
         getRecentMessageCache(page.chatList, messageCacheSize, phoneNumber),
@@ -41,7 +43,7 @@ router.post("/list", async (req, res) => {
         success: true,
         userProfiles,
         messageCache,
-        total_unread: countUnreadChats(userDoc.list),
+        total_unread: countUnreadChats(visibleList),
         nextCursor: page.nextCursor,
         hasMore: page.hasMore,
       });
@@ -364,10 +366,7 @@ router.post("/settings", async (req, res) => {
     const chatsListDoc = await getChatsListByPhoneNumber(
       formatPhoneNumberForAccountId(phoneNumber),
     );
-    const existingList = chatsListDoc && chatsListDoc.list;
-    const chatList = Array.isArray(existingList)
-      ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
-      : existingList && typeof existingList === "object" ? existingList : {};
+    const chatList = chatEntries(chatsListDoc);
     if (!Object.prototype.hasOwnProperty.call(chatList, chatId)) {
       return res.status(404).json({ success: false, message: "Chat not found in user's list." });
     }
@@ -375,12 +374,8 @@ router.post("/settings", async (req, res) => {
     if (setting === "delete") {
       const updatedList = { ...chatList };
       delete updatedList[chatId];
-      await firestoreManager.updateDocument(
-        "ChatsList",
-        formatPhoneNumberForAccountId(phoneNumber),
-        "/",
-        { ...withoutDocumentId(chatsListDoc), list: updatedList },
-      );
+      await firestoreManager.deleteField("ChatsList", "/",
+        formatPhoneNumberForAccountId(phoneNumber), chatId);
       return res.status(200).json({ success: true, chatId, deleted: true });
     }
 
@@ -393,8 +388,7 @@ router.post("/settings", async (req, res) => {
       [field]: storedValue,
     };
     const updatedDocument = {
-      ...withoutDocumentId(chatsListDoc),
-      list: { ...chatList, [chatId]: settings },
+      [chatId]: settings,
     };
     await firestoreManager.updateDocument(
       "ChatsList",
@@ -431,10 +425,7 @@ router.post("/settings/bulk", async (req, res) => {
 
     const accountId = formatPhoneNumberForAccountId(phoneNumber);
     const chatsListDoc = await getChatsListByPhoneNumber(accountId);
-    const existingList = chatsListDoc && chatsListDoc.list;
-    const chatList = Array.isArray(existingList)
-      ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
-      : existingList && typeof existingList === "object" ? existingList : {};
+    const chatList = chatEntries(chatsListDoc);
     const missingChatIds = chatIds.filter(
       (chatId) => !Object.prototype.hasOwnProperty.call(chatList, chatId),
     );
@@ -462,12 +453,12 @@ router.post("/settings/bulk", async (req, res) => {
       }
     }
 
-    await firestoreManager.updateDocument(
-      "ChatsList",
-      accountId,
-      "/",
-      { ...withoutDocumentId(chatsListDoc), list: updatedList },
-    );
+    if (setting === "delete") {
+      for (const chatId of chatIds) await firestoreManager.deleteField("ChatsList", "/", accountId, chatId);
+    } else {
+      await firestoreManager.updateDocument("ChatsList", accountId, "/",
+        Object.fromEntries(chatIds.map(id => [id, updatedList[id]])));
+    }
     if (setting !== "delete") {
       const storedValue = setting === "mute" ? value : Boolean(value);
       for (const chatId of chatIds) {
@@ -508,7 +499,7 @@ router.post("/sync", async (req, res) => {
       });
     }
 
-    const chatIds = getChatIdsFromChatList(chatsListDoc.list);
+    const chatIds = getChatIdsFromChatList(chatEntries(chatsListDoc));
     const chatDocs = await Promise.all(
       chatIds.map(async (chatId) => ({
         chatId,
@@ -531,7 +522,7 @@ router.post("/sync", async (req, res) => {
     return res.status(200).json({
       success: true,
       messages: messages.map(forStorage),
-      chatList: chatsListDoc.list || {},
+      chatList: chatEntries(chatsListDoc),
       syncTime: Date.now(),
     });
   } catch (error) {
@@ -558,7 +549,7 @@ router.post("/discover", async (req, res) => {
     const ownPhoneNumber = normalizePhoneNumberForChatId(phoneNumber);
     const accountId = formatPhoneNumberForAccountId(phoneNumber);
     const chatsListDoc = await getChatsListByPhoneNumber(accountId);
-    const chatList = getChatIdsFromChatList(chatsListDoc && chatsListDoc.list);
+    const chatList = getChatIdsFromChatList(chatEntries(chatsListDoc));
 
     const normalizedContacts = [...new Set(
       contacts
@@ -698,22 +689,7 @@ function findChatIdForContact(chatList, phoneNumber) {
   );
 }
 
-function getChatIdFromChatListItem(chatListItem) {
-  if (typeof chatListItem === "string") {
-    return chatListItem;
-  }
-
-  if (!chatListItem || typeof chatListItem !== "object") {
-    return "";
-  }
-
-  return chatListItem.chatId || chatListItem.id || chatListItem._id || "";
-}
-
 function getChatIdsFromChatList(chatList) {
-  if (Array.isArray(chatList)) {
-    return chatList.map(getChatIdFromChatListItem).filter(Boolean);
-  }
   if (chatList && typeof chatList === "object") {
     return Object.keys(chatList);
   }
@@ -964,7 +940,6 @@ function getChatSettings(chatList, chatId) {
     last_message: null,
   };
   if (
-    !Array.isArray(chatList) &&
     chatList &&
     typeof chatList === "object" &&
     chatList[chatId] &&
@@ -1018,7 +993,7 @@ function paginateChatList(chatList, pageSize, cursor) {
   const entries = chatIds
     .map((chatId) => getChatSortEntry(
       chatId,
-      !Array.isArray(chatList) && chatList ? chatList[chatId] : null,
+      chatList ? chatList[chatId] : null,
     ))
     .sort(compareChatSortEntries);
   const startIndex = cursor
@@ -1231,10 +1206,7 @@ async function clearChatListPreview(userId, chatId) {
   const accountId = formatPhoneNumberForAccountId(userId);
   const existingDoc = await getChatsListByPhoneNumber(accountId);
   if (!existingDoc) return;
-  const existingList = existingDoc.list;
-  const list = Array.isArray(existingList)
-    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
-    : existingList && typeof existingList === "object" ? existingList : {};
+  const list = chatEntries(existingDoc);
   if (!Object.prototype.hasOwnProperty.call(list, chatId)) return;
   const previousLastMessage = list[chatId] && list[chatId].last_message;
   const settings = {
@@ -1254,8 +1226,7 @@ async function clearChatListPreview(userId, chatId) {
     unread_count: 0,
   };
   await firestoreManager.updateDocument("ChatsList", accountId, "/", {
-    ...withoutDocumentId(existingDoc),
-    list: { ...list, [chatId]: settings },
+    [chatId]: settings,
   });
 }
 
@@ -1263,15 +1234,11 @@ async function updateReportLastMessage(userId, chatId, message) {
   const accountId = formatPhoneNumberForAccountId(userId);
   const existingDoc = await getChatsListByPhoneNumber(accountId);
   if (!existingDoc) return;
-  const existingList = existingDoc.list;
-  const list = Array.isArray(existingList)
-    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
-    : existingList && typeof existingList === "object" ? existingList : {};
+  const list = chatEntries(existingDoc);
   const settings = { ...defaultChatSettings(), ...(list[chatId] || {}) };
   settings.last_message = forStorage(message);
   await firestoreManager.updateDocument("ChatsList", accountId, "/", {
-    ...withoutDocumentId(existingDoc),
-    list: { ...list, [chatId]: settings },
+    [chatId]: settings,
   });
 }
 

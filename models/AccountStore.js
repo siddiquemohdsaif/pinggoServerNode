@@ -13,7 +13,7 @@ async function ensureListDocument(collection, accountId) {
   const existing = await readOrNull(collection, accountId);
   if (existing) return existing;
   try {
-    return await firestore.createDocument(collection, accountId, "/", { list: {} });
+    return await firestore.createDocument(collection, accountId, "/", {});
   } catch (_error) {
     const concurrentlyCreated = await readOrNull(collection, accountId);
     if (concurrentlyCreated) return concurrentlyCreated;

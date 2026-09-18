@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { DevicePairingService, LINK_TTL_MS } = require("../services/devicePairingService");
+const { MAX_DEVICES } = require("../models/DeviceStore");
 
 function fixture(deviceCount = 1) {
   const records = new Map();
@@ -11,15 +12,18 @@ function fixture(deviceCount = 1) {
     async read(id) { return records.has(id) ? structuredClone(records.get(id)) : null; },
     async write(id, value) { records.set(id, structuredClone(value)); },
   };
-  const active = Array.from({ length: deviceCount }, (_, index) => ({ deviceId: `active-device-${index}` }));
+  const active = Array.from({ length: deviceCount }, (_, index) => ({
+    deviceId: `active-device-${index}`, role: "companion",
+  }));
   let sessionRevokedAt = 0;
   const devices = {
-    MAX_DEVICES: 5,
+    MAX_DEVICES,
     async listDevices() { return structuredClone(active); },
     async getSessionRevokedAt() { return sessionRevokedAt; },
-    async registerDevice(_accountId, input) {
+    async registerDevice() { throw new Error("Pairing must use linkDevice, not login registration."); },
+    async linkDevice(_accountId, input) {
       if (!active.some((item) => item.deviceId === input.deviceId)) {
-        if (active.length >= 5) throw Object.assign(new Error("maximum"), { statusCode: 409 });
+        if (active.length >= MAX_DEVICES) throw Object.assign(new Error("maximum"), { statusCode: 409 });
         active.push({ ...input });
       }
       return { ...input, role: "companion" };
@@ -78,12 +82,21 @@ test("completed request cannot be reused", async () => {
     pairingSecret: link.pairingSecret }), /not found|already/);
 });
 
-test("maximum five active devices is enforced during approval", async () => {
-  const f = fixture(5);
-  const link = await f.service.createLinkRequest({ deviceId: "sixth-device" });
+test("active companion limit is enforced during approval", async () => {
+  assert.equal(MAX_DEVICES, 4);
+  const f = fixture(MAX_DEVICES);
+  const link = await f.service.createLinkRequest({ deviceId: "extra-companion" });
   await assert.rejects(() => f.service.approve({ accountId: "919999999999",
     approvingDeviceId: "primary-device", linkRequestId: link.linkRequestId,
     pairingSecret: link.pairingSecret }), (error) => error.statusCode === 409);
+});
+
+test("pairing can fill the last companion slot using linkDevice", async () => {
+  const f = fixture(MAX_DEVICES - 1);
+  const link = await approved(f);
+  const result = await f.service.complete({ linkRequestId: link.linkRequestId,
+    pairingSecret: link.pairingSecret });
+  assert.equal(result.device.role, "companion");
 });
 
 test("completion issues a credential only for the requested companion device", async () => {

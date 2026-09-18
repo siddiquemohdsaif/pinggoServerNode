@@ -1,4 +1,5 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { chatEntries } = require("../utils/chatMembership");
 const getFirebaseAdmin = require("../Firebase/firebaseAdmin");
 const { getFcmRegistration, getPrimaryFcmTokens } = require("../models/DeviceStore");
 
@@ -148,8 +149,7 @@ async function isNotificationMuted(receiverId, chatId) {
     const listDoc = await firestoreManager.readDocument(
       "ChatsList", normalizeString(receiverId), "/",
     );
-    const list = listDoc && listDoc.list;
-    const settings = list && !Array.isArray(list) ? list[normalizeString(chatId)] : null;
+    const settings = chatEntries(listDoc)[normalizeString(chatId)];
     const mutedUntil = Number(settings && settings.notification_muted) || 0;
     return mutedUntil === -1 || mutedUntil > Date.now();
   } catch (_error) {

@@ -1,4 +1,5 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { chatEntries } = require("../utils/chatMembership");
 const { callLogForStorage, reportForStorage } = require("../utils/specializedRecords");
 const { forStorage, forClient } = require("../utils/messageTypes");
 
@@ -122,8 +123,7 @@ async function migrateChatsList(summary) {
   const accountIds = await firestore.readCollectionDocumentIds("ChatsList", "/");
   for (const accountId of accountIds) {
     const document = await firestore.readDocument("ChatsList", accountId, "/");
-    const list = document && document.list && typeof document.list === "object"
-      ? { ...document.list } : {};
+    const list = chatEntries(document);
     let changed = false;
     for (const [chatId, originalSettings] of Object.entries(list)) {
       if (!originalSettings || typeof originalSettings !== "object"
@@ -132,7 +132,7 @@ async function migrateChatsList(summary) {
       const lastMessage = { ...settings.last_message };
       const converted = convertType(
         lastMessage.t ?? lastMessage.messageType,
-        `ChatsList/${accountId}/list/${chatId}/last_message`,
+        `ChatsList/${accountId}/${chatId}/last_message`,
         lastMessage,
         summary,
       );
@@ -152,8 +152,7 @@ async function migrateChatsList(summary) {
     }
     if (EXECUTE && changed) {
       await firestore.updateDocument("ChatsList", accountId, "/", {
-        ...withoutDocumentId(document),
-        list,
+        ...list,
       });
       summary.chatListDocumentsChanged++;
     }

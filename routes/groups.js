@@ -24,10 +24,34 @@ const decodeMessageCursor = (value) => {
   }
 };
 
-router.post("/create", wrap(async (req) => ({ group: groupService.publicGroup(await groupService.createGroup({
-  creatorId: actor(req), name: req.body.name, description: req.body.description, icon: req.body.icon,
-  memberIds: req.body.memberIds,
-})) })));
+router.post("/create", wrap(async (req) => {
+  const creatorId = actor(req);
+  if (!creatorId || typeof req.body.name !== "string" || !req.body.name.trim()) {
+    throw new Error("creatorId and name are required.");
+  }
+  let icon = req.body.icon;
+  if (req.body.profilePhotoBase64 != null) {
+    const encoded = req.body.profilePhotoBase64;
+    if (typeof encoded !== "string" || encoded.length > 2_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+      throw new Error("Invalid group photo.");
+    }
+    const sharp = require("sharp");
+    const { saveFile } = require("../utils/fileStorage");
+    const buffer = await sharp(Buffer.from(encoded, "base64"), { failOn: "error", limitInputPixels: 40_000_000 })
+      .rotate().resize(512, 512, { fit: "cover" }).webp({ quality: 82 }).toBuffer();
+    const fileName = `group-${require("crypto").randomBytes(16).toString("hex")}.webp`;
+    const saved = await saveFile({ buffer, requestedPath: `group_photo/${fileName}`,
+      originalName: fileName, mimeType: "image/webp" });
+    const base = process.env.PUBLIC_BASE_URL
+      ? process.env.PUBLIC_BASE_URL.replace(/\/$/, "")
+      : `${req.protocol}://${req.get("host")}${(process.env.PUBLIC_PATH_PREFIX || "/pinggo-app-api").replace(/\/$/, "")}`;
+    icon = `${base}${saved.publicPath}`;
+  }
+  const group = await groupService.createGroup({ creatorId, name: req.body.name,
+    description: req.body.description, icon, memberIds: req.body.memberIds,
+    adminsOnly: req.body.adminsOnly === true });
+  return { group: groupService.publicGroup(group) };
+}));
 router.post("/get", wrap(async (req) => { const group = await groupService.readGroup(req.body.groupId);
   groupService.requireMember(group, actor(req)); return { group: groupService.publicGroup(group) }; }));
 router.post("/details", wrap(async (req) => {

@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { chatEntries } = require("../utils/chatMembership");
 const { getUserSockets, isUserOnline, isUserViewingChat } = require("../realtime/connectionManager");
 const { nextTimestamp } = require("../utils/timestampId");
 const { forStorage } = require("../utils/messageTypes");
@@ -104,12 +105,17 @@ async function mutateChatList(userId, mutate) {
   const id = accountId(userId);
   let doc = null;
   try { doc = await firestore.readDocument("ChatsList", id, "/"); } catch (_error) {}
-  const raw = doc && doc.list;
-  const list = Array.isArray(raw) ? Object.fromEntries(raw.map((key) => [key, {}])) : { ...(raw || {}) };
+  const before = chatEntries(doc);
+  const list = { ...before };
   mutate(list);
-  const body = { ...withoutId(doc || {}), list };
-  try { await firestore.updateDocument("ChatsList", id, "/", body); }
-  catch (_error) { await firestore.createDocument("ChatsList", id, "/", body); }
+  const body = Object.fromEntries(Object.entries(list).filter(([key, value]) =>
+    JSON.stringify(before[key]) !== JSON.stringify(value)));
+  if (Object.keys(body).length) {
+    if (doc) await firestore.updateDocument("ChatsList", id, "/", body);
+    else await firestore.createDocument("ChatsList", id, "/", body);
+  }
+  for (const key of Object.keys(before)) if (!Object.hasOwn(list, key))
+    await firestore.deleteField("ChatsList", "/", id, key);
 }
 async function addToChatList(userId, group) {
   await ensureAccountCollections(userId);
@@ -181,7 +187,7 @@ function requireAdmin(group, userId) {
   if (!isAdmin(group, userId)) { const e = new Error("Group administrator permission required."); e.statusCode = 403; throw e; }
 }
 
-async function createGroup({ creatorId, name, description, icon, memberIds }) {
+async function createGroup({ creatorId, name, description, icon, memberIds, adminsOnly = false }) {
   creatorId = accountId(creatorId); name = text(name);
   if (!creatorId || !name) throw new Error("creatorId and name are required.");
   const ids = [...new Set([creatorId, ...(memberIds || []).map(accountId)].filter(Boolean))];
@@ -194,8 +200,8 @@ async function createGroup({ creatorId, name, description, icon, memberIds }) {
     leftAt: null, addedBy: creatorId, membershipPeriods: [{ joinedAt: now, leftAt: null }] }]));
   const group = { groupId, name: name.slice(0, 100), description: text(description).slice(0, 2048),
     icon: text(icon) || null, createdBy: creatorId, ownerId: creatorId, createdAt: now, updatedAt: now,
-    membershipVersion: 1, permissions: { sendMessages: "members", editInfo: "admins",
-      startCalls: "members", addMembers: "admins", approveMembers: "admins" }, members, invite: null };
+    membershipVersion: 1, permissions: { sendMessages: adminsOnly ? "admins" : "members", editInfo: "admins",
+      startCalls: adminsOnly ? "admins" : "members", addMembers: "admins", approveMembers: "admins" }, members, invite: null };
   await writeGroup(group); await ensureChat(groupId);
   await Promise.all(ids.map((id) => addToChatList(id, group)));
   await systemMessage(group, creatorId, "group_created", ids.filter((id) => id !== creatorId));

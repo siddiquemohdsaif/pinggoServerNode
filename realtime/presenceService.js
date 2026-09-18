@@ -1,4 +1,5 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { chatEntries } = require("../utils/chatMembership");
 const { sendToUser, isUserOnline } = require("./connectionManager");
 
 const firestoreManager = FirestoreManager.getInstance();
@@ -101,15 +102,9 @@ async function getPresenceForUsers(userIds) {
 async function getChatContactIds(userId) {
   try {
     const chatsListDoc = await firestoreManager.readDocument("ChatsList", userId, "/");
-    const storedList = chatsListDoc && chatsListDoc.list;
-    const chatList = Array.isArray(storedList)
-      ? storedList
-      : storedList && typeof storedList === "object"
-        ? Object.keys(storedList)
-        : [];
+    const chatList = Object.keys(chatEntries(chatsListDoc));
 
     return chatList
-      .map(getChatIdFromChatListItem)
       .map((chatId) => getOtherUserIdFromChatId(chatId, userId))
       .filter(Boolean);
   } catch (error) {
@@ -123,16 +118,6 @@ async function readUser(userId) {
   } catch (error) {
     return null;
   }
-}
-
-function getChatIdFromChatListItem(chatListItem) {
-  if (typeof chatListItem === "string") {
-    return chatListItem;
-  }
-  if (!chatListItem || typeof chatListItem !== "object") {
-    return "";
-  }
-  return chatListItem.chatId || chatListItem.id || chatListItem._id || "";
 }
 
 function getOtherUserIdFromChatId(chatId, userId) {

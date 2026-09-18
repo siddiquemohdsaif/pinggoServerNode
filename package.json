@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "remove:list-markers:dry-run": "node test/removeListStorageMarker.js",
+    "remove:list-markers": "node test/removeListStorageMarker.js --execute",
     "test": "node --test test/*.test.js",
     "run": "node index.js",
     "check": "node --check index.js && node --check realtime/websocketServer.js && node --check routes/chatAttachments.js && node --check services/redisClient.js && node --check services/retryQueue.js && node --test test/*.test.js",

@@ -1,4 +1,5 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { isDirectChatParticipant, chatEntries } = require("../utils/chatMembership");
 const { getUserSockets, sendToUser, isUserViewingChat } = require("./connectionManager");
 const { sendOfflineMessageNotification } = require("./fcmService");
 const { isBlockedBy } = require("../utils/blockUtils");
@@ -1150,8 +1151,7 @@ async function findDirectChatId(firstUserId, secondUserId) {
   const first = normalizeAccountId(firstUserId);
   const second = normalizeAccountId(secondUserId);
   const listDocument = await getChatsList(first);
-  const list = listDocument && listDocument.list;
-  const chatIds = Array.isArray(list) ? list : Object.keys(list || {});
+  const chatIds = Object.keys(chatEntries(listDocument));
   return chatIds.find((chatId) => {
     if (String(chatId).startsWith("grp_")) return false;
     const members = String(chatId).split("_").map(normalizeAccountId);
@@ -1181,21 +1181,16 @@ async function createChatDocument(chatId) {
 }
 
 async function addChatIdToChatsList(userId, chatId) {
+  if (!String(chatId).startsWith("grp_") && !isDirectChatParticipant(chatId, userId)) return;
   const accountId = normalizeAccountId(userId);
   const existingDoc = await getChatsList(accountId);
-  const existingList = existingDoc && existingDoc.list;
-  const list = Array.isArray(existingList)
-    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
-    : existingList && typeof existingList === "object"
-      ? existingList
-      : {};
+  const list = chatEntries(existingDoc);
   if (Object.prototype.hasOwnProperty.call(list, chatId)) {
     return;
   }
 
   const updatedDoc = {
-    ...withoutDocumentId(existingDoc || {}),
-    list: { ...list, [chatId]: defaultChatSettings() },
+    [chatId]: defaultChatSettings(),
   };
 
   try {
@@ -1240,15 +1235,11 @@ function latestMessage(messages) {
 }
 
 async function updateLastMessage(userId, chatId, message) {
+  if (!String(chatId).startsWith("grp_") && !isDirectChatParticipant(chatId, userId)) return;
   const accountId = normalizeAccountId(userId);
   const existingDoc = await getChatsList(accountId);
   if (!existingDoc) return;
-  const existingList = existingDoc.list;
-  const list = Array.isArray(existingList)
-    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
-    : existingList && typeof existingList === "object"
-      ? existingList
-      : {};
+  const list = chatEntries(existingDoc);
   const settings = { ...defaultChatSettings(), ...(list[chatId] || {}) };
   const currentLastMessage = settings.last_message;
   if (
@@ -1259,8 +1250,7 @@ async function updateLastMessage(userId, chatId, message) {
   }
   settings.last_message = forStorage(message);
   await firestoreManager.updateDocument("ChatsList", accountId, "/", {
-    ...withoutDocumentId(existingDoc),
-    list: { ...list, [chatId]: settings },
+    [chatId]: settings,
   });
 }
 
@@ -1273,22 +1263,17 @@ async function clearUnreadCount(userId, chatId) {
 }
 
 async function updateUnreadCount(userId, chatId, updater) {
+  if (!String(chatId).startsWith("grp_") && !isDirectChatParticipant(chatId, userId)) return null;
   const accountId = normalizeAccountId(userId);
   const existingDoc = await getChatsList(accountId);
   if (!existingDoc) return;
-  const existingList = existingDoc.list;
-  const list = Array.isArray(existingList)
-    ? Object.fromEntries(existingList.map((id) => [id, defaultChatSettings()]))
-    : existingList && typeof existingList === "object"
-      ? existingList
-      : {};
+  const list = chatEntries(existingDoc);
   const settings = { ...defaultChatSettings(), ...(list[chatId] || {}) };
   const current = Number(settings.unread_count) || 0;
   settings.unread_count = Math.max(0, updater(current));
   const updatedList = { ...list, [chatId]: settings };
   await firestoreManager.updateDocument("ChatsList", accountId, "/", {
-    ...withoutDocumentId(existingDoc),
-    list: updatedList,
+    [chatId]: settings,
   });
   return Object.values(updatedList).reduce((total, chatSettings) =>
     total + (Number(chatSettings && chatSettings.unread_count) > 0 ? 1 : 0), 0);

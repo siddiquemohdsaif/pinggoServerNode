@@ -2,6 +2,7 @@
 
 const crypto = require("crypto");
 const FirestoreManager = require("../Firestore/FirestoreManager");
+const { chatEntries } = require("../utils/chatMembership");
 const { revokeAllDevices } = require("../models/DeviceStore");
 const { upsertShardedEntries } = require("../models/ShardedDocumentStore");
 const { nextTimestamp } = require("../utils/timestampId");
@@ -14,7 +15,7 @@ const { generateP_ID, createP_ID_DOC } = require("../utils/signupUtils");
 const { ensureAccountCollections } = require("../models/AccountStore");
 
 const firestore = FirestoreManager.getInstance();
-const DIRECT_COLLECTIONS = ["ChatsList", "CallsList", "UserBlocks", "LinkedDevices"];
+const DIRECT_COLLECTIONS = ["ChatsList", "CallsList", "UserBlocks", "LinkedDevices", "OldLinkedDevices", "UserDeviceInfo"];
 
 function accountId(value) {
   return String(value || "").trim().replace(/^<plus>/, "").replace(/^\+/, "");
@@ -142,19 +143,17 @@ function sendSocketEvent(socket, event) {
 async function updatePeerAccountState(peerId, chatId, message, active) {
   const document = await readOrNull("ChatsList", peerId);
   if (!document) return;
-  const raw = document.list;
-  const list = Array.isArray(raw) ? Object.fromEntries(raw.map((key) => [key, {}])) : { ...(raw || {}) };
+  const list = chatEntries(document);
   list[chatId] = { ...(list[chatId] || {}), last_message: forStorage(message),
     unread_count: Number(list[chatId] && list[chatId].unread_count || 0) + 1,
     account_active: active,
     profilePhotoUrl: null, profile_photo_url: null };
   delete document._id;
-  await firestore.updateDocument("ChatsList", peerId, "/", { ...document, list });
+  await firestore.updateDocument("ChatsList", peerId, "/", { [chatId]: list[chatId] });
 }
 
 async function notifyDirectContacts(id, chatsList) {
-  const entries = chatsList && chatsList.list;
-  const chatIds = Array.isArray(entries) ? entries : Object.keys(entries || {});
+  const chatIds = Object.keys(chatEntries(chatsList));
   for (const chatId of chatIds.filter((value) => !String(value).startsWith("grp_"))) {
     const peerId = String(chatId).split("_").map(accountId).find((value) => value && value !== id);
     if (!peerId) continue;
@@ -197,7 +196,7 @@ async function deleteAccount(value) {
   if (personalId) await deleteIfPresent("P-ID-MAP", personalId);
   for (const collection of DIRECT_COLLECTIONS) await deleteIfPresent(collection, id);
   // Commit the deletion marker last so a failed cleanup remains retryable by the owner.
-  const directChats = Object.keys((chatsList && chatsList.list) || {})
+  const directChats = Object.keys(chatEntries(chatsList))
     .filter((chatId) => !chatId.startsWith("grp_"))
     .map((chatId) => ({ chatId, peerId: chatId.split("_").map(accountId)
       .find((participant) => participant && participant !== id) }))

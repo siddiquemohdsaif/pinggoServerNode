@@ -7,6 +7,7 @@ const nodeFs = require("fs");
 const os = require("os");
 const { pipeline } = require("stream/promises");
 const { performance } = require("perf_hooks");
+const sharp = require("sharp");
 const metrics = require("../services/performanceMetrics");
 const AES = require("../utils/AES_256");
 const FirestoreManager = require("../Firestore/FirestoreManager");
@@ -204,6 +205,8 @@ router.post("/:uploadId/complete", async (req, res, next) => {
 
     const videoMetadata = manifest.kind === "video"
       ? await normalizeUploadedVideo(finalPath, manifest.mimeType) : null;
+    const visualMetadata = manifest.kind === "image"
+      ? await imageMetadata(finalPath) : videoMetadata;
     const stored = videoMetadata && videoMetadata.normalized
       ? await inspectFile(finalPath) : inspected;
     const storedStat = await fs.stat(finalPath);
@@ -224,6 +227,10 @@ router.post("/:uploadId/complete", async (req, res, next) => {
       completedTime: Date.now(),
       sha256: stored.hash,
       ...(videoMetadata ? { durationMs: videoMetadata.durationMs } : {}),
+      ...(visualMetadata && visualMetadata.width && visualMetadata.height ? {
+        width: visualMetadata.width, height: visualMetadata.height,
+        orientation: visualMetadata.orientation,
+      } : {}),
     };
     await saveAttachment(manifest.chatId, attachment);
     const sessionDir = getChunkSessionDir(manifest.uploadId);
@@ -288,6 +295,7 @@ router.post("/", upload.single("file"), async (req, res, next) => {
     const savedPath = resolveUploadPath(savedFile.fullPath);
     const videoMetadata = kind === "video"
       ? await normalizeUploadedVideo(savedPath, req.file.mimetype) : null;
+    const visualMetadata = kind === "image" ? await imageMetadata(savedPath) : videoMetadata;
     const inspected = await inspectFile(savedPath);
     const storedStat = await fs.stat(savedPath);
     const attachment = {
@@ -304,6 +312,10 @@ router.post("/", upload.single("file"), async (req, res, next) => {
       createdTime: Date.now(),
       sha256: inspected.hash,
       ...(videoMetadata ? { durationMs: videoMetadata.durationMs } : {}),
+      ...(visualMetadata && visualMetadata.width && visualMetadata.height ? {
+        width: visualMetadata.width, height: visualMetadata.height,
+        orientation: visualMetadata.orientation,
+      } : {}),
     };
     await saveAttachment(chatId, attachment);
     return res.status(201).json({ success: true, attachment });
@@ -365,6 +377,15 @@ async function inspectFile(filePath) {
     await handle.close();
   }
   return { hash: digest.digest("hex"), header };
+}
+
+async function imageMetadata(filePath) {
+  const metadata = await sharp(filePath, { failOn: "error" }).metadata();
+  const rotated = [5, 6, 7, 8].includes(Number(metadata.orientation));
+  const width = rotated ? Number(metadata.height) : Number(metadata.width);
+  const height = rotated ? Number(metadata.width) : Number(metadata.height);
+  if (!(width > 0 && height > 0)) return null;
+  return { width, height, orientation: height > width ? "portrait" : "landscape" };
 }
 
 function matchesDeclaredContent(buffer, kind, mimeType) {

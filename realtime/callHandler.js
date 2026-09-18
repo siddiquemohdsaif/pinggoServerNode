@@ -192,6 +192,9 @@ async function handleInvite(ws, payload, sendJson) {
   if (engine === "livekit" && chatId.startsWith("grp_")) {
     return handleLiveKitGroupInvite(ws, payload, chatId, mediaType, sendJson);
   }
+  if (engine === "livekit" && (payload.conference === true || payload.callMode === "group")) {
+    return handleLiveKitConferenceInvite(ws, payload, chatId, mediaType, sendJson);
+  }
   console.log(`[call] invite callId=${requestedCallId || "generated"} caller=${ws.userId}`
     + ` receiver=${receiverId} mediaType=${mediaType} chatId=${chatId} time=${Date.now()}`);
   console.log(`[call] offerSdp callId=${requestedCallId || "generated"}`
@@ -287,6 +290,79 @@ async function handleInvite(ws, payload, sendJson) {
   }
   sendJson(ws, { type: "call_invite_ack", callId, receiverId, state: call.state, serverTime: Date.now() });
   scheduleCallingTimeout(callId, sendJson);
+  return true;
+}
+
+async function handleLiveKitConferenceInvite(ws, payload, chatId, mediaType, sendJson) {
+  const callerId = account(ws.userId);
+  const callId = string(payload.callId) || randomUUID();
+  const requestedParticipants = [...new Set([
+    callerId,
+    ...(Array.isArray(payload.participantIds) ? payload.participantIds.map(account) : []),
+  ].filter(Boolean))];
+  if (requestedParticipants.length < 2) {
+    sendJson(ws, { type: "call_failed", callId,
+      message: "At least one conference participant is required." });
+    return true;
+  }
+  if (requestedParticipants.length > 20) {
+    sendJson(ws, { type: "call_failed", callId,
+      message: "A call supports up to 20 members." });
+    return true;
+  }
+  const existing = calls.get(callId);
+  if (existing) {
+    if (account(existing.callerId) !== callerId || existing.engine !== "livekit") {
+      sendJson(ws, { type: "call_failed", callId, message: "Call id is already in use." });
+      return true;
+    }
+    sendJson(ws, { type: "call_invite_ack", callId, engine: "livekit",
+      participantIds: [...existing.participantIds], state: existing.state,
+      duplicate: true, serverTime: Date.now() });
+    return true;
+  }
+
+  const participantIds = [callerId];
+  for (const userId of requestedParticipants) {
+    if (userId === callerId) continue;
+    if (await isAccountDeleted(userId) || await isBlockedBy(callerId, userId)
+        || await isBlockedBy(userId, callerId)) continue;
+    participantIds.push(userId);
+  }
+  if (participantIds.length < 2) {
+    sendJson(ws, { type: "call_failed", callId,
+      message: "No conference participants are available." });
+    return true;
+  }
+
+  const receiverId = participantIds.find((id) => id !== callerId) || "";
+  const call = { callId, chatId, callerId, receiverId, mediaType, engine: "livekit",
+    participantIds, historyParticipantIds: [...participantIds],
+    joinedParticipantIds: [callerId], conference: true, state: "ringing",
+    participantJoinedAt: {}, participantLeftAt: {},
+    invitedByParticipant: Object.fromEntries(participantIds
+      .filter((userId) => userId !== callerId).map((userId) => [userId, callerId])),
+    createdAt: Date.now(), ringingAt: Date.now(), connectedAt: null,
+    endedAt: null, updatedAt: Date.now() };
+  calls.set(callId, call);
+  for (const userId of participantIds) {
+    if (userId === callerId) continue;
+    const event = { type: "call_invite", engine: "livekit", callId, chatId,
+      callerId, senderId: callerId, receiverId: userId, mediaType,
+      callMode: "group", conference: true,
+      participantIds: [...participantIds], serverTime: Date.now() };
+    const socket = getUserSocket(userId);
+    if (socket) sendJson(socket, event);
+    if (!isUserViewingChat(userId, chatId)) {
+      sendCallNotification({ receiverId: userId, call }).catch((error) =>
+        console.error("Could not send conference call notification:", error.message));
+    }
+  }
+  sendJson(ws, { type: "call_invite_ack", engine: "livekit", callId,
+    participantIds: [...participantIds], state: call.state, serverTime: Date.now() });
+  scheduleCallingTimeout(callId, sendJson);
+  console.log(`[call] livekitConferenceCreated callId=${callId} caller=${callerId}`
+    + ` participants=${participantIds.length} chatId=${chatId}`);
   return true;
 }
 
