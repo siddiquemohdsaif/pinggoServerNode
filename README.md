@@ -53,6 +53,11 @@ LIVEKIT_URL=wss://livekit.example.com
 LIVEKIT_API_KEY=replace-me
 LIVEKIT_API_SECRET=replace-me
 
+WEBRTC_STUN_URLS=stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478
+WEBRTC_TURN_URLS=turn:turn.example.com:3478,turns:turn.example.com:5349
+WEBRTC_TURN_USERNAME=replace-me
+WEBRTC_TURN_CREDENTIAL=replace-me
+
 GOOGLE_WEB_CLIENT_ID=replace-me.apps.googleusercontent.com
 EMAIL_USER=sender@example.com
 EMAIL_PASSWORD=replace-me
@@ -173,6 +178,14 @@ LIVEKIT_API_SECRET=replace-me
 ```
 
 Tokens are room-scoped, use the PingGo account ID as participant identity, and expire after 15 minutes. Voice tokens permit microphone publication; video tokens permit microphone and camera publication.
+
+## Legacy WebRTC ICE
+
+Legacy WebRTC calls fetch their STUN/TURN list from the authenticated
+`GET /calls/webrtc/ice` endpoint. A TURN relay is required for reliable calls
+between mobile networks and restrictive NATs. Set `WEBRTC_TURN_URLS`,
+`WEBRTC_TURN_USERNAME`, and `WEBRTC_TURN_CREDENTIAL` together. If they are
+omitted, the endpoint returns only the configured/default STUN servers.
 
 ## Project layout
 

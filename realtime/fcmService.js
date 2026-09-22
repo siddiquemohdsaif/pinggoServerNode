@@ -73,6 +73,11 @@ async function sendCallNotification({ receiverId, call, missed = false }) {
       engine: call.engine === "livekit" ? "livekit" : "legacy",
       callMode: call.conference || (Array.isArray(call.participantIds)
         && call.participantIds.length > 2) ? "group" : "direct",
+      callWaiting: call.waitingOnCallIdsByParticipant
+        && normalizeString(call.waitingOnCallIdsByParticipant[receiverId]) ? "true" : "false",
+      activeCallId: normalizeString(call.waitingOnCallIdsByParticipant
+        && call.waitingOnCallIdsByParticipant[receiverId]),
+      invitationId: normalizeString(call.invitationId),
       participantIds: JSON.stringify(Array.isArray(call.participantIds)
         ? call.participantIds : [call.callerId, call.receiverId].filter(Boolean)),
       offerType: normalizeString(call.offer && call.offer.type),
@@ -89,13 +94,14 @@ async function sendCallNotification({ receiverId, call, missed = false }) {
   return { success: true, providerData: { messageIds: providerMessageIds } };
 }
 
-async function sendCallCancelledNotification({ receiverId, callId }) {
+async function sendCallCancelledNotification({ receiverId, callId, invitationId = "" }) {
   const fcmTokens = await getFcmTokens(receiverId);
   if (fcmTokens.length === 0) return { success: false, skipped: true, reason: "Receiver FCM token is not available." };
   const providerMessageIds = await sendToTokens(fcmTokens, {
     data: {
       type: "call_cancelled",
       callId: normalizeString(callId),
+      invitationId: normalizeString(invitationId),
     },
     android: { priority: "high", ttl: 45 * 1000 },
   });
@@ -118,8 +124,11 @@ async function sendSessionLogoutNotification({ tokens, accountId, revokedAt, rea
   return { success: true, providerData: { messageIds: providerMessageIds } };
 }
 
-async function sendDeviceActivityNotification({ accountId, event, device, actorDeviceId }) {
-  const tokens = await getPrimaryFcmTokens(accountId);
+async function sendDeviceActivityNotification({ accountId, event, device, actorDeviceId,
+  tokens: suppliedTokens }) {
+  const tokens = suppliedTokens === undefined
+    ? await getPrimaryFcmTokens(accountId)
+    : [...new Set((suppliedTokens || []).map(normalizeString).filter(Boolean))];
   if (tokens.length === 0) return { success: false, skipped: true };
   const data = deviceActivityData({ accountId, event, device, actorDeviceId });
   const providerMessageIds = await sendToTokens(tokens, {
@@ -131,15 +140,17 @@ async function sendDeviceActivityNotification({ accountId, event, device, actorD
 
 function deviceActivityData({ accountId, event, device, actorDeviceId }) {
   const linked = event === "device_linked";
+  const login = event === "device_login";
   const target = device || {};
   const deviceId = normalizeString(target.deviceId);
   const actor = normalizeString(actorDeviceId);
   return {
-    type: linked ? "device_linked" : "device_unlinked",
+    type: login ? "device_login" : linked ? "device_linked" : "device_unlinked",
     accountId: normalizeString(accountId),
     deviceId,
-    deviceName: normalizeString(target.name) || "Companion device",
-    reason: linked ? "linked" : (actor && actor === deviceId ? "self_logout" : "detached"),
+    deviceName: normalizeString(target.name) || (login ? "Android device" : "Companion device"),
+    reason: login ? "login" : linked ? "linked"
+      : (actor && actor === deviceId ? "self_logout" : "detached"),
     changedAt: String(Date.now()),
   };
 }

@@ -41,7 +41,9 @@ const { sendOfflineMessageNotification } = require("./realtime/fcmService");
 
 // app.use(express.json());
 app.use(metrics.httpMiddleware);
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
+// Group-photo endpoints accept Base64 data of up to 2,000,000 characters. Leave
+// room for the JSON envelope so Express does not reject a route-valid upload.
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "3mb" }));
 app.use("/files", express.static(uploadDir));
 
 app.get("/internal/metrics", (req, res) => {

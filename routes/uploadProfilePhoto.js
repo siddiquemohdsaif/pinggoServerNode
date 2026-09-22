@@ -3,6 +3,7 @@ const sharp = require("sharp");
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const AES = require("../utils/AES_256");
 const { deleteFile, maxFileSizeMb, saveFile } = require("../utils/fileStorage");
+const { notifyProfileUpdatedToContacts } = require("../realtime/presenceService");
 
 const firestoreManager = FirestoreManager.getInstance();
 const router = express.Router();
@@ -86,6 +87,8 @@ router.post("/", async (req, res) => {
         console.error("Could not delete previous profile photo:", error.message);
       });
     }
+
+    await notifyProfileUpdatedToContacts(uid, updatedUserData.profileData);
 
     return res.status(200).json({
       success: true,

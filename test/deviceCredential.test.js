@@ -50,8 +50,13 @@ test("revocation lookup applies only to device-bound credentials", () => {
   assert.equal(credentialDeviceId(companionClaims), "companion-device");
 });
 
-test("linked-device notification payload distinguishes link, detach and self logout", () => {
+test("device notification payload distinguishes login, link, detach and self logout", () => {
   const device = { deviceId: "companion-device", name: "Pixel Tablet" };
+  const login = deviceActivityData({
+    accountId: "919999999999", event: "device_login",
+    device: { deviceId: "new-primary", name: "Pixel 9" },
+    actorDeviceId: "new-primary",
+  });
   const linked = deviceActivityData({
     accountId: "919999999999", event: "device_linked", device,
     actorDeviceId: "companion-device",
@@ -66,6 +71,10 @@ test("linked-device notification payload distinguishes link, detach and self log
   });
 
   assert.equal(linked.type, "device_linked");
+  assert.equal(login.type, "device_login");
+  assert.equal(login.deviceId, "new-primary");
+  assert.equal(login.deviceName, "Pixel 9");
+  assert.equal(login.reason, "login");
   assert.equal(linked.accountId, "919999999999");
   assert.equal(linked.deviceId, "companion-device");
   assert.equal(linked.deviceName, "Pixel Tablet");

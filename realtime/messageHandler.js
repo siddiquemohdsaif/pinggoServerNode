@@ -1032,6 +1032,10 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
     return existingMessage;
   }
   const sentTime = nextTimestamp();
+  // Both sides necessarily saw a connected call while participating in it.
+  // Persist its completion entry as seen immediately instead of creating a
+  // false unread message such as "Voice Call(00:44)" after hang-up.
+  const completedCallSeen = Boolean(connectedAt);
   const message = {
     id: String(sentTime), clientMessageId: null, callId, chatId,
       senderId: callerId, receiverId: effectiveReceiver, text,
@@ -1043,8 +1047,10 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
       conferenceCall: Boolean(conference), groupCall: Boolean(groupCall),
       callParticipantIds: participantIds,
       callParticipantDurationsSeconds: participantDurationsSeconds,
-    sentTime, deliveredTime: null,
-    readTime: null, status: "sent",
+    sentTime,
+    deliveredTime: completedCallSeen ? sentTime : null,
+    readTime: completedCallSeen ? sentTime : null,
+    status: completedCallSeen ? "seen" : "sent",
       invisible: suppressedForReceiver ? [effectiveReceiver] : [],
     };
     if (!chatId.startsWith("grp_")) await ensureChatReadyForMessage(
@@ -1066,7 +1072,7 @@ async function saveCallMessage({ callId, chatId, callerId, receiverId, mediaType
       }));
     }
     const unreadByUser = new Map();
-    if (!suppressedForReceiver) for (const userId of recipients) {
+    if (!suppressedForReceiver && !completedCallSeen) for (const userId of recipients) {
       if (userId !== callerId) unreadByUser.set(userId,
         await incrementUnreadCount(userId, chatId).catch(() => null));
     }
@@ -1137,7 +1143,9 @@ async function saveConferenceMessageForAddedParticipant(
     updateLastMessage(inviterId, conferenceChatId, conferenceMessage),
     updateLastMessage(participantId, conferenceChatId, conferenceMessage),
   ]);
-  const unread = await incrementUnreadCount(participantId, conferenceChatId).catch(() => null);
+  const unread = conferenceMessage.readTime == null
+    ? await incrementUnreadCount(participantId, conferenceChatId).catch(() => null)
+    : null;
   for (const userId of [inviterId, participantId]) {
     sendToUser(userId, {
       type: "new_message",

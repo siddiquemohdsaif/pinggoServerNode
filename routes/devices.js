@@ -3,7 +3,7 @@
 const express = require("express");
 const AES = require("../utils/AES_256");
 const { registerDevice, listDevices, listOldDevices, revokeDevice, getDevice,
-  revokeAllDevices, MAX_DEVICES } = require("../models/DeviceStore");
+  getPrimaryFcmTokens, revokeAllDevices, MAX_DEVICES } = require("../models/DeviceStore");
 const { disconnectDevice, disconnectAccount,
   notifyDeviceUnlinked, resolveUnlinkActorDeviceId } = require("../realtime/connectionManager");
 const { sendSessionLogoutNotification,
@@ -22,13 +22,31 @@ router.get("/user-info", async (req, res) => {
 });
 router.post("/login", async (req, res) => {
   try {
+    const accountId = AES.getAuthUid(req);
     const body = req.body || {};
     if (req.auth.deviceId && req.auth.deviceId !== body.deviceId)
       return res.status(403).json({ success: false, message: "Device credential mismatch." });
-    const device = await registerDevice(AES.getAuthUid(req), {
+    const existingDevice = body.deviceId
+      ? await UserDeviceInfo.getDevice(accountId, body.deviceId) : null;
+    // Capture recipients before saving the new device so the device being registered
+    // cannot receive its own new-login alert.
+    const previousPrimaryTokens = !req.auth.deviceId && !existingDevice
+      ? await getPrimaryFcmTokens(accountId) : [];
+    const device = await registerDevice(accountId, {
       ...body, role: req.auth.deviceId ? "companion" : "primary",
     }, { login: true });
-    return res.json({ success: true, device });
+    res.json({ success: true, device });
+    if (previousPrimaryTokens.length > 0) {
+      sendDeviceActivityNotification({
+        accountId,
+        event: "device_login",
+        device,
+        actorDeviceId: device.deviceId,
+        tokens: previousPrimaryTokens,
+      }).catch((error) => console.error(
+        "Could not send new-device-login notification:", error.message));
+    }
+    return undefined;
   } catch (error) { return fail(res, error); }
 });
 
@@ -67,6 +85,29 @@ router.post("/heartbeat", async (req, res) => {
       role: req.auth.deviceId ? "companion" : "primary",
     });
     return res.json({ success: true, device, serverTime: Date.now() });
+  } catch (error) { return fail(res, error); }
+});
+
+router.post("/logout", async (req, res) => {
+  try {
+    const accountId = AES.getAuthUid(req);
+    const deviceId = String((req.body || {}).deviceId || "").trim();
+    if (req.auth.deviceId && req.auth.deviceId !== deviceId) {
+      return res.status(403).json({ success: false, message: "Device credential mismatch." });
+    }
+    const device = await getDevice(accountId, deviceId);
+    if (!device) {
+      return res.status(404).json({ success: false, message: "Device not found." });
+    }
+    if (device.role === "companion") {
+      return res.status(400).json({ success: false,
+        message: "Companion devices must use the unlink operation." });
+    }
+    const loggedOutAt = Date.now();
+    await UserDeviceInfo.logoutDevice(accountId, deviceId, "self_logout", loggedOutAt);
+    res.json({ success: true, deviceId, loggedOutAt });
+    setImmediate(() => disconnectDevice(accountId, deviceId, 4003, "Device logged out."));
+    return undefined;
   } catch (error) { return fail(res, error); }
 });
 

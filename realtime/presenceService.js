@@ -52,6 +52,53 @@ async function notifyPresenceToContacts(userId, payload, sendJson) {
   });
 }
 
+async function notifyProfileUpdatedToContacts(userId, profileData) {
+  const normalizedUserId = normalizeAccountId(userId);
+  if (!normalizedUserId) return;
+  const profile = profileData && typeof profileData === "object" ? profileData : {};
+  const payload = {
+    type: "user_profile_updated",
+    userId: normalizedUserId,
+    name: normalizeString(profile.name || profile.displayName),
+    profilePhotoUrl: normalizeString(profile.profilePhotoUrl),
+    updatedAt: Date.now(),
+  };
+  const directChats = await getDirectChatContacts(normalizedUserId);
+  await Promise.all(directChats.map(({ chatId, contactId }) =>
+    updateContactChatListProfile(contactId, chatId, payload)));
+  const recipients = new Set(directChats.map(({ contactId }) => contactId));
+  // Keep other devices signed into the same account synchronized too.
+  recipients.add(normalizedUserId);
+  recipients.forEach((recipientId) => sendToUser(recipientId, payload,
+    (socket, event) => {
+      if (socket.readyState === undefined || socket.readyState === 1) {
+        try { socket.send(JSON.stringify(event)); } catch (_error) {}
+      }
+    }));
+}
+
+async function updateContactChatListProfile(contactId, chatId, profile) {
+  try {
+    const document = await firestoreManager.readDocument("ChatsList", contactId, "/");
+    const list = chatEntries(document);
+    const existing = list[chatId];
+    if (!existing) return;
+    const updated = {
+      ...existing,
+      serverProfileName: profile.name,
+      server_profile_name: profile.name,
+      profilePhotoUrl: profile.profilePhotoUrl || null,
+      profile_photo_url: profile.profilePhotoUrl || null,
+      profile_updated_at: profile.updatedAt,
+    };
+    await firestoreManager.updateDocument("ChatsList", contactId, "/", {
+      [chatId]: updated,
+    });
+  } catch (error) {
+    console.error("Could not synchronize profile into ChatsList:", error.message);
+  }
+}
+
 async function handleTypingEvent(ws, payload, sendJson, eventType) {
   const chatId = normalizeString(payload.chatId);
   const receiverId = normalizeAccountId(payload.receiverId);
@@ -100,13 +147,17 @@ async function getPresenceForUsers(userIds) {
 }
 
 async function getChatContactIds(userId) {
+  return (await getDirectChatContacts(userId)).map(({ contactId }) => contactId);
+}
+
+async function getDirectChatContacts(userId) {
   try {
     const chatsListDoc = await firestoreManager.readDocument("ChatsList", userId, "/");
-    const chatList = Object.keys(chatEntries(chatsListDoc));
-
-    return chatList
-      .map((chatId) => getOtherUserIdFromChatId(chatId, userId))
-      .filter(Boolean);
+    return Object.keys(chatEntries(chatsListDoc))
+      .filter((chatId) => !chatId.startsWith("grp_"))
+      .map((chatId) => ({ chatId,
+        contactId: getOtherUserIdFromChatId(chatId, userId) }))
+      .filter(({ contactId }) => Boolean(contactId));
   } catch (error) {
     return [];
   }
@@ -153,4 +204,5 @@ module.exports = {
   markUserOffline,
   markUserOnline,
   notifyPresenceToContacts,
+  notifyProfileUpdatedToContacts,
 };

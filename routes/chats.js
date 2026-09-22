@@ -895,6 +895,7 @@ async function getOtherUserProfilesFromChatList(chatList, phoneNumber) {
       phoneNumber:
         normalizePhoneNumberForChatId(profileData.phoneNumber) ||
         contactPhoneNumber,
+      serverProfileName: profileData.name || profileData.displayName || "",
       profilePhotoUrl: profileData.profilePhotoUrl || null,
       isOnline: (user && user.isOnline) || false,
       lastSeen: (user && user.lastSeen) || Date.now(),

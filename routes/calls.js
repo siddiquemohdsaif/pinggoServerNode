@@ -6,6 +6,24 @@ const { canJoinLiveKitCall } = require("../realtime/callHandler");
 
 const router = express.Router();
 
+router.get("/webrtc/ice", (req, res) => {
+  const stunUrls = csv(process.env.WEBRTC_STUN_URLS,
+    ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"]);
+  const turnUrls = csv(process.env.WEBRTC_TURN_URLS, []);
+  const iceServers = [];
+  if (stunUrls.length) iceServers.push({ urls: stunUrls });
+  if (turnUrls.length) {
+    const username = String(process.env.WEBRTC_TURN_USERNAME || "").trim();
+    const credential = String(process.env.WEBRTC_TURN_CREDENTIAL || "").trim();
+    if (!username || !credential) {
+      return res.status(503).json({ success: false, code: "TURN_NOT_CONFIGURED",
+        message: "TURN URLs require WEBRTC_TURN_USERNAME and WEBRTC_TURN_CREDENTIAL." });
+    }
+    iceServers.push({ urls: turnUrls, username, credential });
+  }
+  return res.json({ success: true, iceServers, relayConfigured: turnUrls.length > 0 });
+});
+
 router.post("/livekit/token", async (req, res) => {
   try {
     if (!isLiveKitConfigured()) {
@@ -103,3 +121,8 @@ router.post("/logs/delete", async (req, res) => {
 });
 
 module.exports = router;
+
+function csv(value, fallback) {
+  const values = String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
+  return values.length ? values : fallback;
+}

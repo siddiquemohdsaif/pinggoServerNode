@@ -1,5 +1,6 @@
 const FirestoreManager = require("../Firestore/FirestoreManager");
 const AES = require("./AES_256");
+const { notifyProfileUpdatedToContacts } = require("../realtime/presenceService");
 
 const firestoreManager = FirestoreManager.getInstance();
 
@@ -31,6 +32,9 @@ async function updateProfileField(req, res, fieldName, value, validateValue) {
     delete updatedUserData._id;
 
     await firestoreManager.updateDocument("Users", uid, "/", updatedUserData);
+    if (fieldName === "name") {
+      await notifyProfileUpdatedToContacts(uid, updatedUserData.profileData);
+    }
 
     return res.status(200).json({
       success: true,

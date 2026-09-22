@@ -186,8 +186,25 @@ function requireAdmin(group, userId) {
   requireMember(group, userId);
   if (!isAdmin(group, userId)) { const e = new Error("Group administrator permission required."); e.statusCode = 403; throw e; }
 }
+function requirePermission(group, userId, permission) {
+  requireMember(group, userId);
+  const permissions = group.permissions || {};
+  let mode = permissions[permission];
+  // Older groups stored one editInfo/sendMessages switch for all four capabilities.
+  if (!mode && permission === "editProfilePhoto")
+    mode = permissions.editInfo || permissions.sendMessages;
+  if (!mode && permission === "editName")
+    mode = permissions.editInfo || permissions.sendMessages;
+  if (!mode && permission === "startCalls") mode = permissions.sendMessages;
+  if (mode === "admins" && !isAdmin(group, userId)) {
+    const error = new Error("Only group administrators can perform this action.");
+    error.statusCode = 403;
+    throw error;
+  }
+}
 
-async function createGroup({ creatorId, name, description, icon, memberIds, adminsOnly = false }) {
+async function createGroup({ creatorId, name, description, icon, memberIds, adminsOnly = false,
+  permissions = {} }) {
   creatorId = accountId(creatorId); name = text(name);
   if (!creatorId || !name) throw new Error("creatorId and name are required.");
   const ids = [...new Set([creatorId, ...(memberIds || []).map(accountId)].filter(Boolean))];
@@ -198,10 +215,17 @@ async function createGroup({ creatorId, name, description, icon, memberIds, admi
   const members = Object.fromEntries(ids.map((userId) => [userId, { userId,
     role: userId === creatorId ? "admin" : "member", status: "active", joinedAt: now,
     leftAt: null, addedBy: creatorId, membershipPeriods: [{ joinedAt: now, leftAt: null }] }]));
+  const permissionMode = (key) => permissions?.[key] === "admins"
+    ? "admins" : permissions?.[key] === "members" ? "members"
+      : adminsOnly ? "admins" : "members";
   const group = { groupId, name: name.slice(0, 100), description: text(description).slice(0, 2048),
     icon: text(icon) || null, createdBy: creatorId, ownerId: creatorId, createdAt: now, updatedAt: now,
-    membershipVersion: 1, permissions: { sendMessages: adminsOnly ? "admins" : "members", editInfo: "admins",
-      startCalls: adminsOnly ? "admins" : "members", addMembers: "admins", approveMembers: "admins" }, members, invite: null };
+    membershipVersion: 1, permissions: { sendMessages: permissionMode("sendMessages"),
+      startCalls: permissionMode("startCalls"),
+      editName: permissionMode("editName"),
+      editProfilePhoto: permissionMode("editProfilePhoto"),
+      editInfo: permissionMode("editName"),
+      addMembers: "admins", approveMembers: "admins" }, members, invite: null };
   await writeGroup(group); await ensureChat(groupId);
   await Promise.all(ids.map((id) => addToChatList(id, group)));
   await systemMessage(group, creatorId, "group_created", ids.filter((id) => id !== creatorId));
@@ -345,29 +369,27 @@ async function setRole(groupId, actorId, memberId, role) {
 }
 
 async function updateGroup(groupId, actorId, changes) {
-  const group = await readGroup(groupId); requireAdmin(group, actorId);
-  let adminOnlyChanged = null;
+  const group = await readGroup(groupId);
+  if (changes.permissions !== undefined) requireAdmin(group, actorId);
+  else {
+    if (changes.name !== undefined) requirePermission(group, actorId, "editName");
+    if (changes.description !== undefined) requirePermission(group, actorId, "editInfo");
+    if (changes.icon !== undefined) requirePermission(group, actorId, "editProfilePhoto");
+  }
   if (changes.name !== undefined) { const value = text(changes.name); if (!value) throw new Error("name cannot be empty."); group.name = value.slice(0, 100); }
   if (changes.description !== undefined) group.description = text(changes.description).slice(0, 2048);
   if (changes.icon !== undefined) group.icon = text(changes.icon) || null;
   if (changes.permissions !== undefined) {
     const allowed = ["members", "admins"]; const next = { ...group.permissions };
-    for (const key of ["sendMessages", "startCalls", "editInfo", "addMembers", "approveMembers"]) if (changes.permissions[key] !== undefined) {
+    for (const key of ["sendMessages", "startCalls", "editName", "editProfilePhoto",
+      "editInfo", "addMembers", "approveMembers"]) if (changes.permissions[key] !== undefined) {
       if (!allowed.includes(changes.permissions[key])) throw new Error(`Invalid permission: ${key}.`);
       next[key] = changes.permissions[key];
-    }
-    if (changes.permissions.sendMessages !== undefined) {
-      const mode = changes.permissions.sendMessages;
-      next.startCalls = mode;
-      if (group.permissions?.sendMessages !== mode || group.permissions?.startCalls !== mode) {
-        adminOnlyChanged = mode === "admins";
-      }
     }
     group.permissions = next;
   }
   group.updatedAt = Date.now(); await writeGroup(group); await updateListMetadata(group);
-  await systemMessage(group, actorId, adminOnlyChanged == null ? "group_info_updated"
-    : adminOnlyChanged ? "admin_only_enabled" : "admin_only_disabled");
+  await systemMessage(group, actorId, "group_info_updated");
   broadcast(group, { type: "group_updated", group: publicGroup(group) }); return group;
 }
 
@@ -450,5 +472,5 @@ async function markGroupMessages(ws, payload, sendJson, state) {
 
 module.exports = { activeMember, memberCanAccessAt, memberCanAccessMessage,
   createGroup, changeMembers, leaveGroup, publicGroup, readChat,
-  readGroup, requireAdmin, requireMember, removeDeletedAccount, sendGroupMessage,
+  readGroup, requireAdmin, requireMember, requirePermission, removeDeletedAccount, sendGroupMessage,
   markGroupMessages, setRole, updateGroup };
